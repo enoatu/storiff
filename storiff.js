@@ -98,17 +98,15 @@ function parseDiff(diffText, repo, startId) {
   return { files, change_ids: changeIds, nextId };
 }
 
-// story作成時にClaudeが読む軽量なテキスト版。changes.jsonの整形JSONより行が短い
+// story作成時にClaudeが読むスリム版。コンテキスト行を落とし変更行だけにする
 function buildChangesText(files) {
   const blocks = files.map((file) => {
     const repoTag = file.repo && file.repo !== "." ? file.repo + " " : "";
     const heading = "=== " + repoTag + file.file + " (" + file.status + ") ===";
-    const lines = file.lines.map((line) => {
-      if (line.kind === "context") return "  " + line.text;
-      const marker = line.kind === "add" ? "+" : "-";
-      return marker + "[" + line.id + "] " + line.text;
-    });
-    return heading + "\n" + lines.join("\n");
+    const changedLines = file.lines
+      .filter((line) => line.kind !== "context")
+      .map((line) => (line.kind === "add" ? "+" : "-") + "[" + line.id + "] " + line.text);
+    return heading + "\n" + changedLines.join("\n");
   });
   return blocks.join("\n\n") + "\n";
 }
@@ -124,20 +122,43 @@ function buildFilesMap(files) {
   return lines.join("\n") + "\n";
 }
 
+// レビュー価値の低いノイズファイル。config.json の exclude で追加できる
+const NOISE_PATTERNS = ["*.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "*.min.js", "*.min.css", "*.map"];
+
+function isNoiseFile(filePath, patterns) {
+  const base = filePath.split("/").pop();
+  return patterns.some((pattern) => {
+    if (pattern.includes("*")) {
+      const regexp = new RegExp("^" + pattern.split("*").map((part) => part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$");
+      return regexp.test(base) || regexp.test(filePath);
+    }
+    return base === pattern || filePath === pattern;
+  });
+}
+
 function runPrep(targetDir, repoList) {
-  const files = [];
-  const changeIds = [];
+  const collectedFiles = [];
   const diffTargets = [];
-  let nextId = 1;
   for (const repo of repoList) {
     const diffText = execFileSync("git", ["-C", repo.path, "diff", ...repo.diffArgs], { encoding: "utf8", maxBuffer: 1024 * 1024 * 64 });
     const range = repo.diffArgs.length > 0 ? repo.diffArgs.join(" ") : "working tree";
     diffTargets.push(repo.path === "." ? range : repo.path + " " + range);
     if (diffText.trim() === "") continue;
-    const parsed = parseDiff(diffText, repo.path, nextId);
-    files.push(...parsed.files);
-    changeIds.push(...parsed.change_ids);
-    nextId = parsed.nextId;
+    collectedFiles.push(...parseDiff(diffText, repo.path, 1).files);
+  }
+  const excludePatterns = NOISE_PATTERNS.concat(loadConfig().exclude || []);
+  const files = collectedFiles.filter((file) => !isNoiseFile(file.file, excludePatterns));
+  const excludedCount = collectedFiles.length - files.length;
+  const changeIds = [];
+  let nextId = 1;
+  for (const file of files) {
+    for (const line of file.lines) {
+      if (line.kind === "add" || line.kind === "del") {
+        line.id = nextId;
+        changeIds.push(nextId);
+        nextId += 1;
+      }
+    }
   }
   if (changeIds.length === 0) {
     console.log("変更なし: 差分行が見つかりませんでした");
@@ -151,7 +172,8 @@ function runPrep(targetDir, repoList) {
   fs.writeFileSync(textOutputPath, buildChangesText(files));
   const filesMapPath = path.join(targetDir, "files.txt");
   fs.writeFileSync(filesMapPath, buildFilesMap(files));
-  console.log("生成: " + outputPath + " と " + textOutputPath + " と " + filesMapPath + " (変更ID " + changeIds.length + "件, ファイル " + files.length + "件, リポジトリ " + repos.length + "件)");
+  const excludedNote = excludedCount > 0 ? ", ノイズ除外 " + excludedCount + "件" : "";
+  console.log("生成: " + outputPath + " と " + textOutputPath + " と " + filesMapPath + " (変更ID " + changeIds.length + "件, ファイル " + files.length + "件, リポジトリ " + repos.length + "件" + excludedNote + ")");
 }
 
 // owns_files のパスを、そのファイルの全変更IDに展開する
@@ -205,13 +227,17 @@ function expandOwns(owns) {
   return ids;
 }
 
-// 各stepの owns と owns_files を整数IDの owns に展開する
+// 各stepの owns と owns_files を整数IDの owns に展開する。owns には整数と範囲とF番号を混ぜてよい
 function resolveSteps(files, steps) {
   const unknownFiles = [];
   const resolvedSteps = steps.map((step) => {
-    const expanded = expandOwnsFiles(step.owns_files || [], files);
-    unknownFiles.push(...expanded.unknownFiles);
-    return Object.assign({}, step, { owns: [...expandOwns(step.owns || []), ...expanded.ids] });
+    const rawOwns = step.owns || [];
+    const fileRefs = rawOwns.filter((value) => /^F\d+$/.test(String(value)));
+    const idOwns = rawOwns.filter((value) => !/^F\d+$/.test(String(value)));
+    const fromOwns = expandOwnsFiles(fileRefs, files);
+    const fromOwnsFiles = expandOwnsFiles(step.owns_files || [], files);
+    unknownFiles.push(...fromOwns.unknownFiles, ...fromOwnsFiles.unknownFiles);
+    return Object.assign({}, step, { owns: [...expandOwns(idOwns), ...fromOwns.ids, ...fromOwnsFiles.ids] });
   });
   return { resolvedSteps, unknownFiles };
 }
@@ -253,10 +279,21 @@ function buildStory(targetDir) {
 function appendComment(targetDir, body) {
   const commentsPath = path.join(targetDir, "comments.json");
   const comments = readJson(commentsPath, []);
-  const newComment = Object.assign({}, body, { at: new Date().toISOString() });
+  const newComment = Object.assign({}, body, { replies: [], at: new Date().toISOString() });
   comments.push(newComment);
   fs.writeFileSync(commentsPath, JSON.stringify(comments, null, 2));
   return newComment;
+}
+// コメント番号(1始まり)の replies に AI の返信を追記する
+function appendReply(targetDir, commentNumber, body) {
+  const commentsPath = path.join(targetDir, "comments.json");
+  const comments = readJson(commentsPath, []);
+  const target = comments[commentNumber - 1];
+  if (!target) throw new Error("コメント番号が範囲外です: " + commentNumber);
+  if (!Array.isArray(target.replies)) target.replies = [];
+  target.replies.push({ author: "ai", body: body, at: new Date().toISOString() });
+  fs.writeFileSync(commentsPath, JSON.stringify(comments, null, 2));
+  return target;
 }
 
 function readBody(request) {
@@ -326,6 +363,11 @@ function runServe(targetDir, requestedPort, bindHost) {
         sendJson(response, 200, { done: true });
         return;
       }
+      if (request.method === "POST" && request.url === "/close") {
+        fs.writeFileSync(path.join(targetDir, "close.flag"), new Date().toISOString());
+        sendJson(response, 200, { closed: true });
+        return;
+      }
       response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
       response.end("not found");
     } catch (error) {
@@ -338,14 +380,14 @@ function runServe(targetDir, requestedPort, bindHost) {
   listenOnFreePort(server, startPort, bindHost, (port) => {
     const url = "http://" + displayHost + ":" + port + "/";
     console.log("storiff serve: " + url);
-    console.log("done.flag ができるまで待機します: " + path.join(targetDir, "done.flag"));
+    console.log("レビュー完了(done.flag)を待ちます。終了(close.flag)でサーバを閉じます");
     openBrowser(url);
   });
 
-  const donePath = path.join(targetDir, "done.flag");
+  const closePath = path.join(targetDir, "close.flag");
   const watcher = setInterval(() => {
-    if (fs.existsSync(donePath)) {
-      console.log("レビュー完了を検知しました。サーバを終了します");
+    if (fs.existsSync(closePath)) {
+      console.log("終了の合図を検知しました。サーバを終了します");
       clearInterval(watcher);
       server.close(() => process.exit(0));
     }
@@ -448,7 +490,23 @@ function marker(kind){return kind==='add'?'+':(kind==='del'?'-':' ');}
 function renderComment(comment){
   var box=document.createElement('div');
   box.className='comment';
-  box.textContent=comment.body;
+  var bodyLine=document.createElement('div');
+  bodyLine.className='comment-body';
+  bodyLine.textContent=comment.body;
+  box.appendChild(bodyLine);
+  (comment.replies||[]).forEach(function(reply){
+    var replyBox=document.createElement('div');
+    replyBox.className='reply';
+    var author=document.createElement('span');
+    author.className='reply-author';
+    author.textContent=reply.author==='ai'?'AI':(reply.author||'');
+    var replyBody=document.createElement('div');
+    replyBody.className='reply-body';
+    renderMarkdown(replyBody, reply.body);
+    replyBox.appendChild(author);
+    replyBox.appendChild(replyBody);
+    box.appendChild(replyBox);
+  });
   return box;
 }
 function openForm(row, line, file, stepOrder){
@@ -470,7 +528,7 @@ function openForm(row, line, file, stepOrder){
         if(!commentsByKey[key]) commentsByKey[key]=[];
         commentsByKey[key].push(saved);
         form.parentNode.insertBefore(renderComment(saved), form);
-        input.value='';
+        form.parentNode.removeChild(form);
       });
   };
   form.appendChild(input);
@@ -478,8 +536,20 @@ function openForm(row, line, file, stepOrder){
   row.parentNode.insertBefore(form, row.nextSibling);
   input.focus();
 }
+// 拡張子から highlight.js の言語名を得る
+var LANGUAGE_BY_EXT={js:'javascript',mjs:'javascript',cjs:'javascript',jsx:'javascript',ts:'typescript',tsx:'typescript',py:'python',rb:'ruby',go:'go',rs:'rust',java:'java',c:'c',h:'c',cpp:'cpp',hpp:'cpp',cs:'csharp',php:'php',pl:'perl',pm:'perl',sh:'bash',bash:'bash',zsh:'bash',json:'json',yml:'yaml',yaml:'yaml',html:'xml',xml:'xml',vue:'xml',css:'css',scss:'scss',sql:'sql',md:'markdown'};
+function languageOf(filePath){
+  var ext=String(filePath).split('.').pop().toLowerCase();
+  return LANGUAGE_BY_EXT[ext]||null;
+}
+// 対応言語なら色付けし、未対応やライブラリ未読込ならエスケープだけする
+function highlightText(text, language){
+  if(!language||typeof hljs==='undefined') return esc(text);
+  try{return hljs.highlight(String(text==null?'':text), {language:language, ignoreIllegal:true}).value;}
+  catch(error){return esc(text);}
+}
 // 差分1行のマス目を作る。lineがnullなら片側だけの空マス
-function buildCell(line, ownsSet, refsSet){
+function buildCell(line, ownsSet, refsSet, file){
   var cell=document.createElement('div');
   if(!line){cell.className='line empty'; return cell;}
   cell.className='line '+lineClass(line, ownsSet, refsSet);
@@ -492,7 +562,7 @@ function buildCell(line, ownsSet, refsSet){
   markerLabel.textContent=marker(line.kind);
   var textLabel=document.createElement('span');
   textLabel.className='txt';
-  textLabel.textContent=line.text;
+  textLabel.innerHTML=highlightText(line.text, languageOf(file.file));
   cell.appendChild(numberLabel);
   cell.appendChild(markerLabel);
   cell.appendChild(textLabel);
@@ -506,7 +576,7 @@ function appendExistingComments(parent, line, file){
 }
 // 統合表示の1行を追加する。クリックでコメント欄を開く
 function appendLine(parent, line, file, stepOrder, ownsSet, refsSet){
-  var row=buildCell(line, ownsSet, refsSet);
+  var row=buildCell(line, ownsSet, refsSet, file);
   if(line.id!=null){
     row.className+=' clickable';
     row.onclick=function(){openForm(row, line, file.file, stepOrder);};
@@ -519,7 +589,7 @@ function appendSplitRow(parent, splitLine, file, stepOrder, ownsSet, refsSet){
   var rowElement=document.createElement('div');
   rowElement.className='split-row';
   [splitLine.left, splitLine.right].forEach(function(line){
-    var cell=buildCell(line, ownsSet, refsSet);
+    var cell=buildCell(line, ownsSet, refsSet, file);
     if(line&&line.id!=null){
       cell.className+=' clickable';
       cell.onclick=function(){openForm(rowElement, line, file.file, stepOrder);};
@@ -717,7 +787,18 @@ function render(){
 document.getElementById('prevBtn').onclick=function(){if(stepIndex>0){stepIndex--;render();window.scrollTo(0,0);}};
 document.getElementById('nextBtn').onclick=function(){if(stepIndex<story.steps.length-1){stepIndex++;render();window.scrollTo(0,0);}};
 document.getElementById('doneBtn').onclick=function(){
-  fetch('/done',{method:'POST'}).then(function(){document.getElementById('doneMsg').style.display='block';});
+  fetch('/done',{method:'POST'}).then(function(){
+    var msg=document.getElementById('doneMsg');
+    msg.textContent='コメントを送信しました。AIの返信がまもなく各コメントの下に表示されます';
+    msg.style.display='block';
+  });
+};
+document.getElementById('closeBtn').onclick=function(){
+  fetch('/close',{method:'POST'}).then(function(){
+    var msg=document.getElementById('doneMsg');
+    msg.textContent='レビューを終了しました。このタブは閉じてかまいません';
+    msg.style.display='block';
+  });
 };
 function setViewMode(mode){
   viewMode=mode;
@@ -733,15 +814,37 @@ document.addEventListener('keydown', function(event){
   if(event.key==='ArrowLeft'&&stepIndex>0){stepIndex--;render();window.scrollTo(0,0);}
   if(event.key==='ArrowRight'&&stepIndex<story.steps.length-1){stepIndex++;render();window.scrollTo(0,0);}
 });
+// コメントと返信の数を並べた文字列。変化の検知に使う
+function commentsFingerprint(){
+  var comments=story.comments||[];
+  return comments.length+'#'+comments.map(function(comment){return (comment.replies||[]).length;}).join(',');
+}
+var commentsSignature='';
 fetch('/story.json').then(function(res){return res.json();}).then(function(data){
-  story=data; indexComments(); render();
+  story=data; indexComments(); commentsSignature=commentsFingerprint(); render();
 });
+// AI の返信を拾うため story.json を定期取得し、変化があれば再描画する
+setInterval(function(){
+  fetch('/story.json').then(function(res){return res.json();}).then(function(data){
+    story=data; indexComments();
+    var latest=commentsFingerprint();
+    if(latest===commentsSignature) return;
+    if(document.querySelector('.comment-form')) return;
+    commentsSignature=latest;
+    var scrollY=window.scrollY;
+    render();
+    window.scrollTo(0, scrollY);
+  });
+}, 3000);
 `;
 
 const VIEWER_HTML = `<!doctype html>
 <html lang='ja'><head><meta charset='utf-8'>
 <meta name='viewport' content='width=device-width, initial-scale=1'>
 <title>storiff</title>
+<link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github.min.css' media='(prefers-color-scheme: light)'>
+<link rel='stylesheet' href='https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/styles/github-dark.min.css' media='(prefers-color-scheme: dark)'>
+<script src='https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.11.1/highlight.min.js'></script>
 <style>
 :root{
   --sidebar-width:280px;
@@ -845,11 +948,38 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 }
 .fold:hover{background:var(--accent-soft)}
 .split-row{display:flex}
-.split-row>.line{flex:1 1 0;min-width:0;overflow-x:auto;border-right:1px solid var(--border-soft)}
+.split-row>.line{flex:1 1 0;min-width:0;white-space:pre-wrap;word-break:break-all;border-right:1px solid var(--border-soft)}
 .split-row>.line:last-child{border-right:none}
-.comment{background:var(--accent-soft);border-left:3px solid var(--accent);margin:4px 12px 4px 46px;padding:7px 12px;border-radius:0 6px 6px 0;font-family:inherit;font-size:13px;white-space:pre-wrap}
+.comment{background:var(--accent-soft);border-left:3px solid var(--accent);margin:4px 12px 4px 46px;padding:7px 12px;border-radius:0 6px 6px 0;font-family:inherit;font-size:13px}
+.comment-body{white-space:pre-wrap}
+.reply{margin-top:8px;padding-top:8px;border-top:1px solid var(--border-soft)}
+.reply-author{display:inline-block;font-size:11px;font-weight:700;color:var(--accent);margin-bottom:3px}
+.reply-body{white-space:normal;line-height:1.6}
 .comment-form{margin:4px 12px 8px 46px;display:flex;gap:8px}
 .comment-form input{flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:13px}
+@media (prefers-color-scheme: dark){
+  :root{
+    --text-main:#e6edf3;
+    --text-soft:#9198a1;
+    --border:#3d444d;
+    --border-soft:#2a2f38;
+    --surface:#161b22;
+    --surface-soft:#0d1117;
+    --accent:#6c8cff;
+    --accent-soft:#1b2440;
+  }
+  .done-btn:hover:not(:disabled){background:#5577ff}
+  .banner-box{background:#2b2410;border-color:#5a4a1a;color:#e3c56b}
+  .done-msg{background:#132a1a;border-color:#2f6b42;color:#5cc47f}
+  .file-head .status{background:#2a2f38}
+  .file-note{background:#0f141b}
+  .add{background:#12261a}
+  .add .mark{color:#3fb950}
+  .del{background:#291416}
+  .del .mark{color:#f85149}
+  .add.own{background:#1c3b28}
+  .del.own{background:#3d1d1f}
+}
 </style></head><body>
 <div class='sidebar'>
 <h1 id='storyTitle' class='sidebar-title'></h1>
@@ -867,12 +997,13 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 </div>
 <span class='spacer'></span>
 <button id='doneBtn' class='done-btn'>レビュー完了</button>
+<button id='closeBtn'>終了</button>
 </div>
 <h2 id='stepTitle' class='step-heading'></h2>
 <p id='narration' class='narration'></p>
 </div></header>
 <div class='content'>
-<div id='doneMsg' class='done-msg' style='display:none'>レビュー完了を送信しました。ご確認ありがとうございました</div>
+<div id='doneMsg' class='done-msg' style='display:none'>コメントを送信しました。AIの返信がまもなく各コメントの下に表示されます</div>
 <div id='banner'></div>
 <div id='diff'></div>
 </div>
@@ -885,7 +1016,7 @@ function main() {
   const command = args[0];
   const targetDir = args[1];
   if (!command || !targetDir) {
-    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... | node storiff.js check <dir> | node storiff.js merge <dir> | node storiff.js serve <dir> [--port N] [--host H]");
+    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... | node storiff.js check <dir> | node storiff.js reply <dir> <コメント番号> <本文> | node storiff.js serve <dir> [--port N] [--host H]");
     process.exit(1);
   }
   if (command === "check") {
@@ -898,7 +1029,16 @@ function main() {
     const validation = buildValidation(changes.change_ids, changes.files, steps.steps || []);
     if (!validation.ok) {
       console.log("ng:");
-      if (validation.missing.length > 0) console.log("  未割り当ての変更ID " + validation.missing.length + "件: " + validation.missing.slice(0, 50).join(","));
+      if (validation.missing.length > 0) {
+        const missingSet = new Set(validation.missing);
+        const unassignedFiles = [];
+        changes.files.forEach((file, index) => {
+          const ids = file.lines.filter((line) => line.id != null && missingSet.has(line.id)).map((line) => line.id);
+          if (ids.length > 0) unassignedFiles.push("F" + (index + 1) + " " + file.file + " (id " + ids[0] + "-" + ids[ids.length - 1] + ")");
+        });
+        console.log("  未割り当てのファイル(どこかのstepに足す):");
+        for (const line of unassignedFiles) console.log("    " + line);
+      }
       if (validation.duplicated.length > 0) console.log("  重複した変更ID " + validation.duplicated.length + "件: " + validation.duplicated.slice(0, 50).join(","));
       if (validation.unknown_files.length > 0) console.log("  不明なファイル: " + validation.unknown_files.join(", "));
       process.exit(1);
@@ -932,37 +1072,20 @@ function main() {
     }
     return;
   }
-  if (command === "merge") {
-    const stepsPath = path.join(targetDir, "steps.json");
-    const doc = readJson(stepsPath, null);
-    if (!doc || !Array.isArray(doc.steps)) {
-      console.log("steps.json がありません: 先に骨組みを書いてください");
+  if (command === "reply") {
+    const commentNumber = parseInt(args[2], 10);
+    const body = args.slice(3).join(" ");
+    if (!commentNumber || !body) {
+      console.log("使い方: node storiff.js reply <dir> <コメント番号> <本文>");
       process.exit(1);
     }
-    const notesByOrder = new Map();
-    for (const name of fs.readdirSync(targetDir)) {
-      if (!/^notes-.*\.json$/.test(name)) continue;
-      let note = null;
-      try {
-        note = JSON.parse(fs.readFileSync(path.join(targetDir, name), "utf8"));
-      } catch (error) {
-        console.log("警告 " + name + " は壊れているので飛ばす");
-        continue;
-      }
-      if (note && note.order != null) notesByOrder.set(note.order, note);
+    try {
+      appendReply(targetDir, commentNumber, body);
+    } catch (error) {
+      console.log(error.message);
+      process.exit(1);
     }
-    let filled = 0;
-    doc.steps = doc.steps.map((step) => {
-      const note = notesByOrder.get(step.order);
-      if (!note) return step;
-      filled++;
-      return Object.assign({}, step, {
-        narration: note.narration != null ? note.narration : step.narration,
-        file_notes: note.file_notes != null ? note.file_notes : step.file_notes,
-      });
-    });
-    fs.writeFileSync(stepsPath, JSON.stringify(doc, null, 2));
-    console.log("merge: " + filled + " / " + doc.steps.length + " step に narration を反映(owns は不変)");
+    console.log("reply: コメント" + commentNumber + " に返信を追記しました");
     return;
   }
   if (command === "prep") {
