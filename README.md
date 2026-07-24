@@ -11,6 +11,24 @@ story + diff。巨大な差分をAIが小さな意図単位のストーリーに
 
 差分の各変更行に通し番号(変更ID)を振り、Claudeがそれを意図・ビジネスロジック単位のstepにまとめる。全変更IDがどれかのstepにちょうど1回ずつ入るので、ストーリーをすべて合わせると指定した差分のdiffになる。
 
+## インストール
+`~/.claude/skills/storiff` をこのリポジトリの `.claude/skills/storiff` へ symlink すると、どのプロジェクトからでも `/storiff` を呼べる。スキルディレクトリ内の `storiff.js` と `docs` はリポジトリ本体への symlink なので、元はこのリポジトリ1つに保たれる。
+
+```
+ln -sfn "$(pwd)/.claude/skills/storiff" ~/.claude/skills/storiff
+```
+
+セッションごとの生成物(changes.json や comments.json)は `~/.storiff/<日時>/` に置かれる。
+
+## 設定ファイル
+`~/.storiff/config.json` に既定値を書ける。今のところ `host` のみ対応。
+
+```json
+{"host": "0.0.0.0"}
+```
+
+書いておくと、以降 `--host` を付けずに serve するだけで外部からホスト名で見られる。CLI の `--host` を指定した場合はそちらが優先される。0.0.0.0 は届く人全員に差分とコメントが見えるので一時的な用途に限る。
+
 ## 使い方
 1. `/storiff` を実行する
 2. 表示されたURLをブラウザで開き、stepを読みながら気になる行にコメントする
