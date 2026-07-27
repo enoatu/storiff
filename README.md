@@ -12,11 +12,14 @@ story + diff。巨大な差分をAIが小さな意図単位のストーリーに
 差分の各変更行に通し番号(変更ID)を振り、Claudeがそれを意図・ビジネスロジック単位のstepにまとめる。全変更IDがどれかのstepにちょうど1回ずつ入るので、ストーリーをすべて合わせると指定した差分のdiffになる。
 
 ## インストール
-`~/.claude/skills/storiff` をこのリポジトリの `.claude/skills/storiff` へ symlink すると、どのプロジェクトからでも `/storiff` を呼べる。スキルディレクトリ内の `storiff.js` と `docs` はリポジトリ本体への symlink なので、元はこのリポジトリ1つに保たれる。
+Claude Code のプラグインとして入れる。marketplace を1回追加してからインストールする。
 
 ```
-ln -sfn "$(pwd)/.claude/skills/storiff" ~/.claude/skills/storiff
+/plugin marketplace add enoatu/storiff
+/plugin install storiff@storiff
 ```
+
+以降どのプロジェクトからでも `/storiff` で呼べる(同名コマンドと衝突するときは `/storiff:storiff`)。npm も symlink も不要。プラグインが storiff.js と skill と docs を同梱する。
 
 セッションごとの生成物(changes.json や comments.json)は `~/.storiff/<日時>/` に置かれる。
 
@@ -40,7 +43,9 @@ ln -sfn "$(pwd)/.claude/skills/storiff" ~/.claude/skills/storiff
 | --- | --- |
 | `storiff.js` | prep(差分解析)と serve(ビューア配信)を行うNode単一ファイル |
 | `docs/story-schema.md` | データ契約 |
-| `.claude/skills/storiff/SKILL.md` | `/storiff` の skill 定義 |
+| `skills/storiff/SKILL.md` | `/storiff` の skill 定義 |
+| `.claude-plugin/plugin.json` | プラグイン定義 |
+| `.claude-plugin/marketplace.json` | marketplace 定義 |
 
 ## データ契約
 changes.json / steps.json / story.json や HTTP API の定義は [docs/story-schema.md](docs/story-schema.md) を参照。

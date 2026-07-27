@@ -1,0 +1,4 @@
+enotiru-my-box/
+node_modules/
+*.log
+.DS_Store

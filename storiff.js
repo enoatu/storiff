@@ -553,6 +553,7 @@ function buildCell(line, ownsSet, refsSet, file){
   var cell=document.createElement('div');
   if(!line){cell.className='line empty'; return cell;}
   cell.className='line '+lineClass(line, ownsSet, refsSet);
+  if(line.id!=null) cell.dataset.id=line.id;
   var lineNumber=(line.new==null?(line.old==null?'':line.old):line.new);
   var numberLabel=document.createElement('span');
   numberLabel.className='num';
@@ -762,6 +763,94 @@ function renderSplitCode(code, file, stepOrder, ownsSet, refsSet, visible){
     }
   }
 }
+var mmOrder=[], mmTotal=0, mmIndexById={}, mmStepById={}, mmMarkById={}, mmBuilt=false;
+// 全ファイルの変更IDを差分の自然順に並べ、右側ミニマップを組む
+function buildMinimap(){
+  var inner=document.getElementById('minimapInner');
+  inner.innerHTML='';
+  mmOrder=[]; mmIndexById={}; mmStepById={}; mmMarkById={};
+  (story.steps||[]).forEach(function(step, stepPosition){
+    (step.owns||[]).forEach(function(id){ mmStepById[id]=stepPosition; });
+  });
+  var fileStarts=[];
+  (story.files||[]).forEach(function(file){
+    var start=mmOrder.length;
+    file.lines.forEach(function(line){ if(line.id!=null) mmOrder.push(line.id); });
+    if(mmOrder.length>start) fileStarts.push({index:start, name:file.file});
+  });
+  mmTotal=mmOrder.length;
+  if(mmTotal===0){ mmBuilt=false; return; }
+  mmOrder.forEach(function(id, position){ mmIndexById[id]=position; });
+  fileStarts.forEach(function(fileStart){
+    var topPercent=(fileStart.index/mmTotal)*100;
+    var separator=document.createElement('div');
+    separator.className='mm-sep';
+    separator.style.top=topPercent+'%';
+    var label=document.createElement('div');
+    label.className='mm-label';
+    label.style.top=topPercent+'%';
+    label.textContent=fileStart.name.split('/').pop();
+    inner.appendChild(separator);
+    inner.appendChild(label);
+  });
+  mmOrder.forEach(function(id, position){
+    var mark=document.createElement('div');
+    mark.className='mm-mark';
+    mark.style.top=(position/mmTotal)*100+'%';
+    inner.appendChild(mark);
+    mmMarkById[id]=mark;
+  });
+  var band=document.createElement('div');
+  band.id='mmViewport';
+  band.className='mm-viewport';
+  band.style.display='none';
+  inner.appendChild(band);
+  mmBuilt=true;
+}
+// 現在stepが持つ行を強調、参照行を副次強調、他は淡く
+function updateMinimapHighlight(ownsSet, refsSet){
+  if(!mmBuilt) return;
+  mmOrder.forEach(function(id){
+    var mark=mmMarkById[id];
+    if(!mark) return;
+    mark.className='mm-mark'+(ownsSet[id]?' own':(refsSet[id]?' ref':''));
+  });
+}
+// いま画面に見えている変更行の範囲をミニマップ上の帯で示す
+function updateMinimapViewport(){
+  if(!mmBuilt) return;
+  var band=document.getElementById('mmViewport');
+  if(!band) return;
+  var cells=document.querySelectorAll('#diff .line[data-id]');
+  var windowHeight=window.innerHeight;
+  var minIndex=null, maxIndex=null;
+  cells.forEach(function(cell){
+    var rect=cell.getBoundingClientRect();
+    if(rect.bottom<0||rect.top>windowHeight) return;
+    var position=mmIndexById[cell.dataset.id];
+    if(position==null) return;
+    if(minIndex===null||position<minIndex) minIndex=position;
+    if(maxIndex===null||position>maxIndex) maxIndex=position;
+  });
+  if(minIndex===null){ band.style.display='none'; return; }
+  band.style.display='block';
+  band.style.top=(minIndex/mmTotal)*100+'%';
+  band.style.height=Math.max(0.5, ((maxIndex-minIndex+1)/mmTotal)*100)+'%';
+}
+// ミニマップをクリックした位置の変更行へ移動する
+function minimapJump(clientY){
+  if(!mmBuilt) return;
+  var inner=document.getElementById('minimapInner');
+  var rect=inner.getBoundingClientRect();
+  var position=Math.floor(((clientY-rect.top)/rect.height)*mmTotal);
+  if(position<0) position=0;
+  if(position>mmTotal-1) position=mmTotal-1;
+  var id=mmOrder[position];
+  var targetStep=mmStepById[id];
+  if(targetStep!=null&&targetStep!==stepIndex){ stepIndex=targetStep; render(); }
+  var element=document.querySelector('#diff .line[data-id="'+id+'"]');
+  if(element) element.scrollIntoView({block:'center'});
+}
 function render(){
   var step=story.steps[stepIndex];
   document.getElementById('storyTitle').textContent=story.title||'storiff';
@@ -783,6 +872,8 @@ function render(){
   orderedFiles(shownFiles, step, ownsSet).forEach(function(file){
     diff.appendChild(renderFile(file, step, ownsSet, refsSet));
   });
+  updateMinimapHighlight(ownsSet, refsSet);
+  updateMinimapViewport();
 }
 document.getElementById('prevBtn').onclick=function(){if(stepIndex>0){stepIndex--;render();window.scrollTo(0,0);}};
 document.getElementById('nextBtn').onclick=function(){if(stepIndex<story.steps.length-1){stepIndex++;render();window.scrollTo(0,0);}};
@@ -808,6 +899,9 @@ function setViewMode(mode){
 }
 document.getElementById('unifiedBtn').onclick=function(){setViewMode('unified');};
 document.getElementById('splitBtn').onclick=function(){setViewMode('split');};
+document.querySelector('.minimap').onclick=function(event){minimapJump(event.clientY);};
+window.addEventListener('scroll', updateMinimapViewport);
+window.addEventListener('resize', updateMinimapViewport);
 document.addEventListener('keydown', function(event){
   var tag=event.target&&event.target.tagName;
   if(tag==='INPUT'||tag==='TEXTAREA') return;
@@ -821,7 +915,7 @@ function commentsFingerprint(){
 }
 var commentsSignature='';
 fetch('/story.json').then(function(res){return res.json();}).then(function(data){
-  story=data; indexComments(); commentsSignature=commentsFingerprint(); render();
+  story=data; indexComments(); commentsSignature=commentsFingerprint(); buildMinimap(); render();
 });
 // AI の返信を拾うため story.json を定期取得し、変化があれば再描画する
 setInterval(function(){
@@ -848,6 +942,7 @@ const VIEWER_HTML = `<!doctype html>
 <style>
 :root{
   --sidebar-width:280px;
+  --minimap-width:96px;
   --text-main:#1f2328;
   --text-soft:#59636e;
   --border:#d1d9e0;
@@ -885,7 +980,15 @@ body{
 }
 .step-item.active .step-num{background:var(--accent);color:#fff}
 .step-item-title{flex:1;padding-top:1px;word-break:break-word}
-.main{margin-left:var(--sidebar-width)}
+.main{margin-left:var(--sidebar-width);margin-right:var(--minimap-width)}
+.minimap{position:fixed;top:0;right:0;width:var(--minimap-width);height:100vh;background:var(--surface);border-left:1px solid var(--border);overflow:hidden;z-index:5;cursor:pointer}
+.minimap-inner{position:relative;height:100%;width:100%}
+.mm-label{position:absolute;left:5px;font-size:9px;line-height:1.2;color:var(--text-soft);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:86px;pointer-events:none}
+.mm-sep{position:absolute;left:0;right:0;border-top:1px solid var(--border-soft)}
+.mm-mark{position:absolute;right:6px;width:40px;height:2px;background:#c8d1da}
+.mm-mark.own{background:var(--accent);width:60px}
+.mm-mark.ref{background:#d4a72c;width:52px}
+.mm-viewport{position:absolute;left:0;right:0;background:var(--accent-soft);border-top:1px solid var(--accent);border-bottom:1px solid var(--accent);opacity:.55;pointer-events:none}
 .top-header{
   position:sticky;top:0;z-index:10;background:var(--surface);
   border-bottom:1px solid var(--border);padding:16px 32px;
@@ -979,6 +1082,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
   .del .mark{color:#f85149}
   .add.own{background:#1c3b28}
   .del.own{background:#3d1d1f}
+  .mm-mark{background:#39424d}
 }
 </style></head><body>
 <div class='sidebar'>
@@ -1008,6 +1112,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 <div id='diff'></div>
 </div>
 </div>
+<div class='minimap'><div id='minimapInner' class='minimap-inner'></div></div>
 <script>${VIEWER_SCRIPT}</script>
 </body></html>`;
 

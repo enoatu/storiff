@@ -1,0 +1,9 @@
+{
+  "name": "storiff",
+  "description": "Review a big diff as an intent-by-intent story in a local paper-theater viewer",
+  "version": "0.1.0",
+  "author": {
+    "name": "enoatu",
+    "url": "https://github.com/enoatu"
+  }
+}

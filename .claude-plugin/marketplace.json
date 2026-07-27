@@ -1,0 +1,14 @@
+{
+  "name": "storiff",
+  "owner": {
+    "name": "enoatu",
+    "url": "https://github.com/enoatu"
+  },
+  "plugins": [
+    {
+      "name": "storiff",
+      "source": "./",
+      "description": "Review a big diff as an intent-by-intent story in a local paper-theater viewer"
+    }
+  ]
+}
