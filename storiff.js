@@ -8,6 +8,10 @@ const os = require("os");
 // 1stepがおおよそ1時間の作業に収まる目安の変更行数。これを超えるstepは分割の候補
 const CHANGED_LINES_PER_STEP_GUIDE = 80;
 
+// serve のデーモン起動を待つときのポーリング間隔と上限
+const SERVE_POLL_INTERVAL_MSEC = 200;
+const SERVE_START_TIMEOUT_MSEC = 10000;
+
 function readJson(filePath, fallback) {
   if (!fs.existsSync(filePath)) return fallback;
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
@@ -130,7 +134,10 @@ function buildFilesMap(files) {
 // レビュー価値の低いノイズファイル。config.json の exclude で追加できる
 const NOISE_PATTERNS = ["*.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "*.min.js", "*.min.css", "*.map"];
 
-function isNoiseFile(filePath, patterns) {
+// 自動生成ファイル。除外はせず末尾の場面に回す。config.json の generated で追加できる
+const GENERATED_PATTERNS = ["*.generated.*", "*.gen.*", "*.pb.go"];
+
+function matchesFilePattern(filePath, patterns) {
   if (!filePath) return false;
   const base = filePath.split("/").pop();
   return patterns.some((pattern) => {
@@ -152,9 +159,14 @@ function runPrep(targetDir, repoList) {
     if (diffText.trim() === "") continue;
     collectedFiles.push(...parseDiff(diffText, repo.path, 1).files);
   }
-  const excludePatterns = NOISE_PATTERNS.concat(loadConfig().exclude || []);
-  const files = collectedFiles.filter((file) => !isNoiseFile(file.file, excludePatterns));
-  const excludedCount = collectedFiles.length - files.length;
+  const config = loadConfig();
+  const excludePatterns = NOISE_PATTERNS.concat(config.exclude || []);
+  const reviewableFiles = collectedFiles.filter((file) => !matchesFilePattern(file.file, excludePatterns));
+  const excludedCount = collectedFiles.length - reviewableFiles.length;
+  const generatedPatterns = GENERATED_PATTERNS.concat(config.generated || []);
+  const normalFiles = reviewableFiles.filter((file) => !matchesFilePattern(file.file, generatedPatterns));
+  const generatedFiles = reviewableFiles.filter((file) => matchesFilePattern(file.file, generatedPatterns));
+  const files = normalFiles.concat(generatedFiles);
   const changeIds = [];
   let nextId = 1;
   for (const file of files) {
@@ -347,9 +359,21 @@ function listenOnFreePort(server, startPort, bindHost, onReady) {
   tryListen();
 }
 
-function runServe(targetDir, requestedPort, bindHost) {
+function readServeInfo(targetDir) {
+  return readJson(path.join(targetDir, "serve.json"), null);
+}
+
+function writeServeInfo(targetDir, info) {
+  fs.writeFileSync(path.join(targetDir, "serve.json"), JSON.stringify(info, null, 2));
+}
+
+function runServeDaemon(targetDir, requestedPort, bindHost) {
   const server = http.createServer(async (request, response) => {
     try {
+      if (request.method === "GET" && request.url === "/health") {
+        sendJson(response, 200, { pid: process.pid });
+        return;
+      }
       if (request.method === "GET" && request.url === "/") {
         response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         response.end(VIEWER_HTML);
@@ -385,9 +409,9 @@ function runServe(targetDir, requestedPort, bindHost) {
   const displayHost = bindHost === "0.0.0.0" ? os.hostname() : bindHost;
   listenOnFreePort(server, startPort, bindHost, (port) => {
     const url = "http://" + displayHost + ":" + port + "/";
+    writeServeInfo(targetDir, { pid: process.pid, port: port, host: bindHost, url: url, startedAt: new Date().toISOString() });
     console.log("storiff serve: " + url);
     console.log("レビュー完了(done.flag)を待ちます。終了(close.flag)でサーバを閉じます");
-    openBrowser(url);
   });
 
   const closePath = path.join(targetDir, "close.flag");
@@ -395,9 +419,66 @@ function runServe(targetDir, requestedPort, bindHost) {
     if (fs.existsSync(closePath)) {
       console.log("終了の合図を検知しました。サーバを終了します");
       clearInterval(watcher);
-      server.close(() => process.exit(0));
+      server.close(() => {
+        try {
+          fs.unlinkSync(path.join(targetDir, "serve.json"));
+        } catch (error) {
+        }
+        process.exit(0);
+      });
     }
   }, 1000);
+}
+
+function isServeAlive(info, onResult) {
+  if (info == null || info.pid == null || info.port == null) {
+    onResult(false);
+    return;
+  }
+  try {
+    process.kill(info.pid, 0);
+  } catch (error) {
+    onResult(false);
+    return;
+  }
+  const requestHost = info.host === "0.0.0.0" ? "127.0.0.1" : info.host;
+  const request = http.get({ host: requestHost, port: info.port, path: "/health", timeout: 1000 }, (response) => {
+    onResult(response.statusCode === 200);
+    response.resume();
+  });
+  request.on("error", () => onResult(false));
+  request.on("timeout", () => {
+    request.destroy();
+    onResult(false);
+  });
+}
+
+function startServeDaemon(targetDir, requestedPort, bindHost) {
+  const daemonArgs = ["serve", targetDir, "--daemon", "--host", bindHost];
+  if (requestedPort != null) {
+    daemonArgs.push("--port", String(requestedPort));
+  }
+  const logFd = fs.openSync(path.join(targetDir, "serve.log"), "a");
+  const child = spawn(process.execPath, [__filename, ...daemonArgs], { stdio: ["ignore", logFd, logFd], detached: true });
+  child.on("error", () => {
+    console.log("ビューアを起動できませんでした");
+  });
+  child.unref();
+  const waitStartedAt = Date.now();
+  const waiter = setInterval(() => {
+    const info = readServeInfo(targetDir);
+    if (info != null && info.pid === child.pid) {
+      clearInterval(waiter);
+      console.log("storiff serve: " + info.url);
+      openBrowser(info.url);
+      process.exit(0);
+    }
+    if (Date.now() - waitStartedAt > SERVE_START_TIMEOUT_MSEC) {
+      clearInterval(waiter);
+      console.log("ビューアの起動に失敗しました");
+      process.exit(1);
+    }
+  }, SERVE_POLL_INTERVAL_MSEC);
 }
 
 const VIEWER_SCRIPT = `
@@ -1336,7 +1417,20 @@ function main() {
     if (hostIndex !== -1 && args[hostIndex + 1]) {
       bindHost = args[hostIndex + 1];
     }
-    runServe(targetDir, requestedPort, bindHost);
+    if (args.includes("--daemon")) {
+      runServeDaemon(targetDir, requestedPort, bindHost);
+      return;
+    }
+    const existing = readServeInfo(targetDir);
+    isServeAlive(existing, (alive) => {
+      if (alive) {
+        console.log("storiff serve: " + existing.url);
+        console.log("すでに起動しているビューアに接続しました");
+        openBrowser(existing.url);
+        return;
+      }
+      startServeDaemon(targetDir, requestedPort, bindHost);
+    });
     return;
   }
   console.log("不明なコマンド: " + command);

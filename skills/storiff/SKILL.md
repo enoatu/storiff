@@ -20,7 +20,7 @@ story + diff。カレントの作業差分を意図単位のstepに分け、紙�
    - 各stepに title と narration と file_notes。narration はユーザーと会話している言語で、`code`・改行・行頭 - の箇条書きを使う
    - 全変更IDがどれかの owns にちょうど1回ずつ。既出コードは refs
    - `<dir>/steps.json` に書き、`node ${CLAUDE_PLUGIN_ROOT}/storiff.js check <dir>` を ok まで回す。ok ならパスだけ報告する
-4. `node ${CLAUDE_PLUGIN_ROOT}/storiff.js serve <dir>` をバックグラウンドで起動し、URLを伝える。「レビュー完了」で `done.flag`、「終了」で `close.flag`
+4. `node ${CLAUDE_PLUGIN_ROOT}/storiff.js serve <dir>` を実行し、URLを伝える。serve は tool のタイムアウトに縛られない常駐デーモンを立てて URL をすぐ返す。同じ dir で再実行すると起動済みのビューアにつなぎ直す。「レビュー完了」で `done.flag`、「終了」で `close.flag`
 5. 1回のBash呼び出しをバックグラウンドで実行し、シェルの待ちループで待つ。ターンを繰り返して待たない
 
    ```
