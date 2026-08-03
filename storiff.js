@@ -300,7 +300,7 @@ function appendComment(targetDir, body) {
   const newComment = Object.assign({}, body, { replies: [], at: new Date().toISOString() });
   comments.push(newComment);
   fs.writeFileSync(commentsPath, JSON.stringify(comments, null, 2));
-  return newComment;
+  return { comment: newComment, commentNumber: comments.length };
 }
 // コメント番号(1始まり)の replies に AI の返信を追記する
 function appendReply(targetDir, commentNumber, body) {
@@ -312,6 +312,57 @@ function appendReply(targetDir, commentNumber, body) {
   target.replies.push({ author: "ai", body: body, at: new Date().toISOString() });
   fs.writeFileSync(commentsPath, JSON.stringify(comments, null, 2));
   return target;
+}
+
+function buildFileDiffText(file) {
+  return file.lines
+    .filter((line) => line.kind === "add" || line.kind === "del")
+    .map((line) => (line.kind === "add" ? "+ " : "- ") + line.text)
+    .join("\n");
+}
+
+function buildAskPrompt(targetDir, comment) {
+  const changes = readJson(path.join(targetDir, "changes.json"), { files: [] });
+  const steps = readJson(path.join(targetDir, "steps.json"), { steps: [] });
+  const file = changes.files.find((file) => file.file === comment.file);
+  const diffText = file ? buildFileDiffText(file) : "";
+  const step = (steps.steps || []).find((step) => (step.order != null ? step.order : 0) === comment.step_order);
+  const narration = step ? step.narration : "";
+  return [
+    "以下のコード差分について、レビュアーからの質問に簡潔に答えてください",
+    "",
+    "ファイル " + comment.file,
+    "ストーリーの説明 " + narration,
+    "",
+    "該当の差分",
+    diffText,
+    "",
+    "質問 " + comment.body,
+  ].join("\n");
+}
+
+function askHaiku(sessionId, prompt, onDone) {
+  const claudeArgs = ["-p", "--resume", sessionId, "--model", "haiku", "--no-session-persistence", "--output-format", "json", prompt];
+  const child = spawn("claude", claudeArgs);
+  const chunks = [];
+  child.stdout.on("data", (chunk) => chunks.push(chunk));
+  child.on("close", () => {
+    try {
+      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+      onDone(parsed.result || "");
+    } catch (error) {
+      onDone("");
+    }
+  });
+  child.on("error", () => onDone(""));
+}
+
+function replyWithHaiku(targetDir, sessionId, comment, commentNumber) {
+  const prompt = buildAskPrompt(targetDir, comment);
+  askHaiku(sessionId, prompt, (answer) => {
+    if (answer === "") return;
+    appendReply(targetDir, commentNumber, answer);
+  });
 }
 
 function readBody(request) {
@@ -367,7 +418,7 @@ function writeServeInfo(targetDir, info) {
   fs.writeFileSync(path.join(targetDir, "serve.json"), JSON.stringify(info, null, 2));
 }
 
-function runServeDaemon(targetDir, requestedPort, bindHost) {
+function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
   const server = http.createServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/health") {
@@ -385,7 +436,10 @@ function runServeDaemon(targetDir, requestedPort, bindHost) {
       }
       if (request.method === "POST" && request.url === "/comments") {
         const body = await readBody(request);
-        sendJson(response, 200, appendComment(targetDir, body));
+        const { comment, commentNumber } = appendComment(targetDir, body);
+        sendJson(response, 200, comment);
+        const info = readServeInfo(targetDir);
+        if (info != null && info.sessionId != null) replyWithHaiku(targetDir, info.sessionId, comment, commentNumber);
         return;
       }
       if (request.method === "POST" && request.url === "/done") {
@@ -409,7 +463,7 @@ function runServeDaemon(targetDir, requestedPort, bindHost) {
   const displayHost = bindHost === "0.0.0.0" ? os.hostname() : bindHost;
   listenOnFreePort(server, startPort, bindHost, (port) => {
     const url = "http://" + displayHost + ":" + port + "/";
-    writeServeInfo(targetDir, { pid: process.pid, port: port, host: bindHost, url: url, startedAt: new Date().toISOString() });
+    writeServeInfo(targetDir, { pid: process.pid, port: port, host: bindHost, url: url, sessionId: sessionId, startedAt: new Date().toISOString() });
     console.log("storiff serve: " + url);
     console.log("レビュー完了(done.flag)を待ちます。終了(close.flag)でサーバを閉じます");
   });
@@ -453,10 +507,13 @@ function isServeAlive(info, onResult) {
   });
 }
 
-function startServeDaemon(targetDir, requestedPort, bindHost) {
+function startServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
   const daemonArgs = ["serve", targetDir, "--daemon", "--host", bindHost];
   if (requestedPort != null) {
     daemonArgs.push("--port", String(requestedPort));
+  }
+  if (sessionId != null) {
+    daemonArgs.push("--session-id", sessionId);
   }
   const logFd = fs.openSync(path.join(targetDir, "serve.log"), "a");
   const child = spawn(process.execPath, [__filename, ...daemonArgs], { stdio: ["ignore", logFd, logFd], detached: true });
@@ -857,7 +914,7 @@ function buildMinimap(){
   var inner=document.getElementById('minimapInner');
   if(mmBuilt) return;
   inner.innerHTML='';
-  
+
   mmOrder=[]; mmIndexById={}; mmStepById={};
   (story.steps||[]).forEach(function(step, stepPosition){
     (step.owns||[]).forEach(function(id){ mmStepById[id]=stepPosition; });
@@ -865,7 +922,7 @@ function buildMinimap(){
 
   var mapContainer = document.createElement('div');
   mapContainer.className = 'mm-full-diff';
-  
+
   var html = '';
   (story.files||[]).forEach(function(file){
     html += '<div class="mm-file" data-filename="'+esc(file.file)+'"><div class="mm-file-code">';
@@ -879,26 +936,26 @@ function buildMinimap(){
     });
     html += '</div></div>';
   });
-  
+
   mapContainer.innerHTML = html;
-  
+
   var wrap = document.createElement('div');
   wrap.id = 'mmWrap';
   wrap.style.width = (100 / MM_SCALE) + '%';
   wrap.style.transformOrigin = 'top left';
   wrap.style.transform = 'scale(' + MM_SCALE + ')';
   wrap.appendChild(mapContainer);
-  
+
   inner.appendChild(wrap);
-  
-  
-  
+
+
+
   var band = document.createElement('div');
   band.id = 'mmViewport';
   band.className = 'mm-viewport';
   band.style.display = 'none';
   inner.appendChild(band);
-  
+
   mmBuilt=true;
 }
 
@@ -923,7 +980,7 @@ function updateMinimapViewport(){
   var windowHeight = window.innerHeight;
   var topId = null, bottomId = null;
   var minTop = Infinity, maxBottom = -Infinity;
-  
+
   cells.forEach(function(cell) {
     var rect = cell.getBoundingClientRect();
     if(rect.bottom > 0 && rect.top < windowHeight) {
@@ -931,21 +988,21 @@ function updateMinimapViewport(){
       if(rect.bottom > maxBottom) { maxBottom = rect.bottom; bottomId = cell.dataset.id; }
     }
   });
-  
+
   var band = document.getElementById('mmViewport');
   if(!topId) { band.style.display = 'none'; return; }
-  
+
   var topEl = document.querySelector('.mm-full-diff .mm-line[data-id="'+topId+'"]');
   var bottomEl = bottomId ? document.querySelector('.mm-full-diff .mm-line[data-id="'+bottomId+'"]') : topEl;
-  
+
   if(topEl && bottomEl) {
     var top = topEl.offsetTop * MM_SCALE;
     var bottom = (bottomEl.offsetTop + bottomEl.offsetHeight) * MM_SCALE;
-    
+
     band.style.display = 'block';
     band.style.top = top + 'px';
     band.style.height = Math.max(10, bottom - top) + 'px';
-    
+
     var inner = document.getElementById('minimapInner');
     var targetScroll = top - (inner.clientHeight / 2);
     inner.scrollTop = targetScroll;
@@ -957,8 +1014,8 @@ function minimapJump(clientY){
   var inner = document.getElementById('minimapInner');
   var rect = inner.getBoundingClientRect();
   var clickY = clientY - rect.top + inner.scrollTop;
-  var targetY = clickY / MM_SCALE; 
-  
+  var targetY = clickY / MM_SCALE;
+
   var lines = document.querySelectorAll('.mm-full-diff .mm-line[data-id]');
   var closestId = null;
   var minDist = Infinity;
@@ -966,12 +1023,12 @@ function minimapJump(clientY){
     var dist = Math.abs(line.offsetTop - targetY);
     if(dist < minDist) { minDist = dist; closestId = line.dataset.id; }
   });
-  
+
   if(closestId) {
     var targetStep = mmStepById[closestId];
-    if(targetStep != null && targetStep !== stepIndex) { 
-      stepIndex = targetStep; 
-      render(); 
+    if(targetStep != null && targetStep !== stepIndex) {
+      stepIndex = targetStep;
+      render();
     }
     setTimeout(function(){
       var element = document.querySelector('#diff .line[data-id="'+closestId+'"]');
@@ -1034,8 +1091,8 @@ document.querySelector('.minimap').addEventListener('mousemove', function(event)
   var inner = document.getElementById('minimapInner');
   var rect = inner.getBoundingClientRect();
   var clickY = event.clientY - rect.top + inner.scrollTop;
-  var targetY = clickY / MM_SCALE; 
-  
+  var targetY = clickY / MM_SCALE;
+
   var lines = document.querySelectorAll('.mm-full-diff .mm-line[data-id]');
   var closestId = null;
   var minDist = Infinity;
@@ -1043,7 +1100,7 @@ document.querySelector('.minimap').addEventListener('mousemove', function(event)
     var dist = Math.abs(line.offsetTop - targetY);
     if(dist < minDist && dist < 150) { minDist = dist; closestId = line.dataset.id; }
   });
-  
+
   if(closestId) {
     var stepPos = mmStepById[closestId];
     var stepObj = story.steps[stepPos];
@@ -1267,7 +1324,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
   .mm-add { background: #12261a; color: #3fb950; }
   .mm-del { background: #291416; color: #f85149; }
   .mm-line.mm-own { background: #1b2440; border-left-color: #6c8cff; }
-  
+
 }
 </style></head><body>
 <div class='sidebar'>
@@ -1417,8 +1474,13 @@ function main() {
     if (hostIndex !== -1 && args[hostIndex + 1]) {
       bindHost = args[hostIndex + 1];
     }
+    let sessionId = null;
+    const sessionIndex = args.indexOf("--session-id");
+    if (sessionIndex !== -1 && args[sessionIndex + 1]) {
+      sessionId = args[sessionIndex + 1];
+    }
     if (args.includes("--daemon")) {
-      runServeDaemon(targetDir, requestedPort, bindHost);
+      runServeDaemon(targetDir, requestedPort, bindHost, sessionId);
       return;
     }
     const existing = readServeInfo(targetDir);
@@ -1429,7 +1491,7 @@ function main() {
         openBrowser(existing.url);
         return;
       }
-      startServeDaemon(targetDir, requestedPort, bindHost);
+      startServeDaemon(targetDir, requestedPort, bindHost, sessionId);
     });
     return;
   }
@@ -1437,4 +1499,8 @@ function main() {
   process.exit(1);
 }
 
-main();
+if (require.main === module) main();
+
+module.exports.buildFileDiffText = buildFileDiffText;
+module.exports.buildAskPrompt = buildAskPrompt;
+module.exports.askHaiku = askHaiku;
