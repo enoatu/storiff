@@ -42,10 +42,10 @@ Claude Code のプラグインとして入れる。marketplace を1回追加し�
 | ファイル | 役割 |
 | --- | --- |
 | `storiff.js` | prep(差分解析)と serve(ビューア配信)を行うNode単一ファイル |
-| `docs/ストーリー-schema.md` | データ契約 |
+| `docs/story-schema.md` | データ契約 |
 | `skills/storiff/SKILL.md` | `/storiff` の skill 定義 |
 | `.claude-plugin/plugin.json` | プラグイン定義 |
 | `.claude-plugin/marketplace.json` | marketplace 定義 |
 
 ## データ契約
-changes.json / ステップs.json / ストーリー.json や HTTP API の定義は [docs/ストーリー-schema.md](docs/ストーリー-schema.md) を参照。
+changes.json と steps.json と story.json や HTTP API の定義は [docs/story-schema.md](docs/story-schema.md) を参照。

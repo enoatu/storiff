@@ -8,9 +8,9 @@ storiff.js(Node単一ファイル)とビューア、skill が共有する契約�
 
 ## storiff.js の使い方
 - `node storiff.js prep <dir> [--repo P [範囲]]...` : `git diff` を解析し `<dir>/changes.json` と `<dir>/changes.txt` と `<dir>/files.txt` を書き出す。引数なしでカレントの作業差分。範囲(`main...HEAD` など)を後ろに付けられる。`--repo <path> [範囲]` を並べると複数リポジトリを1つにまとめ変更IDを通し番号にする。変更なしなら何も書かない
-- `node storiff.js check <dir>` : `ステップs.json` を検算し、抜けID・重複ID・不明ファイルを表示する。ok なら何も無い
+- `node storiff.js check <dir>` : `steps.json` を検算し、抜けID・重複ID・不明ファイルを表示する。ok なら何も無い
 - `node storiff.js reply <dir> <コメント番号> <本文>` : comments.json の指定コメント(並び順1始まり)の `replies` に AI の返信を追記する
-- `node storiff.js serve <dir> [--port N] [--host H]` : changes.json と ステップs.json を読みビューアを配信しブラウザを開く。`<dir>/close.flag` で終了する(`done.flag` では止まらない)。バインド先は既定 127.0.0.1、`--host 0.0.0.0` で外部からホスト名で見られる
+- `node storiff.js serve <dir> [--port N] [--host H] [--session-id ID]` : changes.json と steps.json を読みビューアを配信しブラウザを開く。`--session-id` を渡すと、行コメントに haiku がその場で返信する。`<dir>/close.flag` で終了する(`done.flag` では止まらない)。バインド先は既定 127.0.0.1、`--host 0.0.0.0` で外部からホスト名で見られる
 - バインド先は `~/.storiff/config.json` の `host` でも指定できる(`{"host": "0.0.0.0"}`)。CLI の `--host` が優先
 
 依存は Node 組み込みのみ(http, fs, child_process, path, url)。Node 20+。
@@ -54,7 +54,7 @@ storiff.js(Node単一ファイル)とビューア、skill が共有する契約�
 ファイルごとに変更IDの範囲と件数を1行で持つ。
 ```
 F1 [1-18] (18) modified README.md
-F2 [19-52] (34) modified docs/ストーリー-schema.md
+F2 [19-52] (34) modified docs/story-schema.md
 F3 [53-236] (184) modified storiff.js
 ```
 - `F番号` そのファイルの短い識別子。owns にそのまま入れるとファイル1つ丸ごとを所有できる
@@ -62,11 +62,11 @@ F3 [53-236] (184) modified storiff.js
 - `(件数)` 変更行の数
 - 続けて status、repo(単一リポジトリなら省略)、パス
 
-## ステップs.json(skill が生成)
+## steps.json(skill が生成)
 ```json
 {
   "title": "ユーザー取得の安全性強化と削除機能の追加",
-  "ステップs": [
+  "steps": [
     {"order": 1, "title": "入力の安全性を固める", "narration": "まず `getUser` に...\n- null を弾く\n- **例外**を投げる", "owns": [1, 2], "refs": []},
     {"order": 2, "title": "削除できるようにする", "narration": "次に...", "owns_files": ["src/user.js"], "refs": [2], "file_notes": {"src/user.js": "`deleteUser` を追加"}}
   ]
@@ -96,13 +96,13 @@ F3 [53-236] (184) modified storiff.js
 8. narration には背景と理由を書く。そのステップだけで他人に説明できる分量にする。一文で終わらせない
 9. `node storiff.js check <dir>` で確認する。大きく複数ファイルにまたがるステップは ng になるので分割する
 
-## ストーリー.json(serve が配信 = changes + ステップs をマージ)
+## story.json(serve が配信 = changes と steps をマージしたもの)
 ```json
 {
   "title": "...",
   "files": [ ... ],
   "change_ids": [ ... ],
-  "ステップs": [ ... ],
+  "steps": [ ... ],
   "validation": {"ok": true, "missing": [], "duplicated": []},
   "comments": [ ... ]
 }
@@ -113,16 +113,16 @@ F3 [53-236] (184) modified storiff.js
 | メソッド | パス | 内容 |
 | --- | --- | --- |
 | GET | / | ビューアHTML(storiff.js に埋め込み) |
-| GET | /ストーリー.json | マージ済み ストーリー + validation + comments |
+| GET | /story.json | マージ済みのストーリーと validation と comments |
 | POST | /comments | 行コメント追記。`<dir>/comments.json` に追記 |
 | POST | /done | `<dir>/done.flag` を書く。skill はこれを合図に返信する。serve は止めない |
 | POST | /close | `<dir>/close.flag` を書く。serve はこれで終了する |
 
 POST /comments の body
 ```json
-{"change_id": 2, "file": "src/user.js", "line": 3, "ステップ_order": 1, "body": "ここなぜ?"}
+{"change_id": 2, "file": "src/user.js", "line": 3, "step_order": 1, "body": "ここなぜ?"}
 ```
-comments.json は上記に `replies` と `at`(ISO文字列)を足した配列。1つの返信は `{"author": "ai", "body": "...", "at": "..."}`。
+comments.json は上記に `replies` と `at`(ISO文字列)を足した配列。1つの返信は `{"author": "ai", "body": "...", "at": "..."}`。serve に `--session-id` を渡してあると、コメント追記のたびに haiku が答えて replies に入る
 
 ## ビューアの振る舞い
 - 左に固定サイドバー(目次)。全ステップを縦リストで並べ現在ステップを強調。クリックでジャンプ
@@ -131,7 +131,7 @@ comments.json は上記に `replies` と `at`(ISO文字列)を足した配列。
 - 差分は左右並列(split)が既定。統合(unified)と切り替えるトグルがあり、選択はステップ移動後も保つ
 - ファイル見出しにパスと status。複数リポジトリのときは repo をタグ表示。file_notes は見出しの下に出す
 - 行クリックでコメント欄。送信で POST /comments。AIの返信は各コメントの下にスレッドで積む
-- /ストーリー.json を数秒ごとに取得し、コメントや返信が増えたときだけ再描画する。コメント欄を開いている間は再描画しない
+- /story.json を数秒ごとに取得し、コメントや返信が増えたときだけ再描画する。コメント欄を開いている間は再描画しない
 - 「レビュー完了」で POST /done、「終了」で POST /close
 - validation.ok が false なら missing/duplicated/unknown_files を警告バナー表示
 - add=緑、del=赤の配色で、OSの設定に合わせてダークモードにも切り替わる
