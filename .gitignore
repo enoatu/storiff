@@ -2,6 +2,7 @@ enotiru-my-box/
 node_modules/
 *.log
 .DS_Store
+CLAUDE.md
 
 changes.json
 changes.txt
