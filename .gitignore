@@ -2,3 +2,15 @@ enotiru-my-box/
 node_modules/
 *.log
 .DS_Store
+
+changes.json
+changes.txt
+files.txt
+steps.json
+comments.json
+serve.json
+*.flag
+
+!.claude/
+.claude/*
+!.claude/skills/
