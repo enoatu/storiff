@@ -131,6 +131,92 @@ function buildFilesMap(files) {
   return lines.join("\n") + "\n";
 }
 
+// 変更行のキーごとに変更IDの配列を返す。前回と今回の差分を突き合わせるための下準備
+function buildLineKeyIndex(files) {
+  const keyToIds = new Map();
+  for (const file of files) {
+    for (const line of file.lines) {
+      if (line.id == null) continue;
+      const key = [file.repo, file.file, line.kind, line.text].join("\0");
+      if (!keyToIds.has(key)) keyToIds.set(key, []);
+      keyToIds.get(key).push(line.id);
+    }
+  }
+  return keyToIds;
+}
+
+// 旧IDから新IDへの対応表を作る。前回だけにあったIDは lostIds、今回だけにあったIDは newIds に入る
+function buildIdMap(previousFiles, currentFiles) {
+  const previousIndex = buildLineKeyIndex(previousFiles);
+  const currentIndex = buildLineKeyIndex(currentFiles);
+  const idMap = new Map();
+  const lostIds = [];
+  for (const [key, previousIds] of previousIndex) {
+    const currentIds = currentIndex.get(key) || [];
+    for (const [index, previousId] of previousIds.entries()) {
+      if (index < currentIds.length) idMap.set(previousId, currentIds[index]);
+      else lostIds.push(previousId);
+    }
+  }
+  const takenIds = new Set(idMap.values());
+  const newIds = [];
+  for (const file of currentFiles) {
+    for (const line of file.lines) {
+      if (line.id != null && !takenIds.has(line.id)) newIds.push(line.id);
+    }
+  }
+  return { idMap, lostIds: lostIds.sort((left, right) => left - right), newIds };
+}
+
+// 連続する整数IDを範囲文字列に畳む。単独のIDは整数のまま返す
+function foldIdsToRanges(ids) {
+  const sortedIds = [...ids].sort((left, right) => left - right);
+  const folded = [];
+  let start = null;
+  let previous = null;
+  const flushRange = () => {
+    folded.push(start === previous ? start : start + "-" + previous);
+  };
+  for (const id of sortedIds) {
+    if (start == null) {
+      start = id;
+      previous = id;
+      continue;
+    }
+    if (id === previous + 1) {
+      previous = id;
+      continue;
+    }
+    flushRange();
+    start = id;
+    previous = id;
+  }
+  if (start != null) flushRange();
+  return folded;
+}
+
+// 旧owns整数IDをidMapで新IDに写し、owns_filesを持たない新しいsteps配列を返す
+function remapSteps(previousFiles, stepList, idMap) {
+  const resolved = resolveSteps(previousFiles, stepList);
+  return resolved.resolvedSteps.map((step) => {
+    const previousOwns = step.owns;
+    const previousRefs = expandOwns(step.refs || []);
+    const owns = previousOwns.map((id) => idMap.get(id)).filter((id) => id != null);
+    const refs = previousRefs.map((id) => idMap.get(id)).filter((id) => id != null);
+    const remapped = Object.assign({}, step, { owns: foldIdsToRanges(owns), refs: foldIdsToRanges(refs) });
+    delete remapped.owns_files;
+    return remapped;
+  });
+}
+
+// コメントのchange_idをidMapで新IDに写す。写せないものはnullにする
+function remapComments(comments, idMap) {
+  return comments.map((comment) => {
+    const changeId = idMap.get(comment.change_id);
+    return Object.assign({}, comment, { change_id: changeId == null ? null : changeId });
+  });
+}
+
 // レビュー価値の低いノイズファイル。config.json の exclude で追加できる
 const NOISE_PATTERNS = ["*.lock", "package-lock.json", "yarn.lock", "pnpm-lock.yaml", "*.min.js", "*.min.css", "*.map"];
 
@@ -150,11 +236,25 @@ function matchesFilePattern(filePath, patterns) {
 }
 
 function runPrep(targetDir, repoList) {
+  const previousChanges = readJson(path.join(targetDir, "changes.json"), null);
+  const previousSteps = readJson(path.join(targetDir, "steps.json"), null);
+  const isFollow = previousChanges != null && previousSteps != null;
+  const effectiveRepoList = isFollow && previousChanges.repo_args ? previousChanges.repo_args : repoList;
+  const cwd = isFollow ? previousChanges.cwd || process.cwd() : process.cwd();
   const collectedFiles = [];
   const diffTargets = [];
-  for (const repo of repoList) {
-    const diffText = execFileSync("git", ["-C", repo.path, "diff", ...repo.diffArgs], { encoding: "utf8", maxBuffer: 1024 * 1024 * 64 });
-    const range = repo.diffArgs.length > 0 ? repo.diffArgs.join(" ") : "working tree";
+  for (const repo of effectiveRepoList) {
+    const repoPath = isFollow ? path.resolve(cwd, repo.path) : repo.path;
+    const diffArgs = repo.diffArgs.length > 0 ? repo.diffArgs : ["HEAD"];
+    let diffText;
+    try {
+      diffText = execFileSync("git", ["-C", repoPath, "diff", ...diffArgs], { encoding: "utf8", maxBuffer: 1024 * 1024 * 64 });
+    } catch (error) {
+      const gitMessage = (error.stderr ? error.stderr.toString() : String(error.message)).split("\n")[0].trim();
+      console.log("git diff に失敗しました: " + gitMessage);
+      return;
+    }
+    const range = diffArgs.join(" ");
     diffTargets.push(repo.path === "." ? range : repo.path + " " + range);
     if (diffText.trim() === "") continue;
     collectedFiles.push(...parseDiff(diffText, repo.path, 1).files);
@@ -179,19 +279,80 @@ function runPrep(targetDir, repoList) {
     }
   }
   if (changeIds.length === 0) {
+    if (isFollow) {
+      console.log("追従しません: 差分が0件になりました。全部コミット済みか範囲がずれています。既存のストーリーはそのまま残します");
+      return;
+    }
     console.log("変更なし: 差分行が見つかりませんでした");
     return;
   }
-  const repos = repoList.map((repo) => repo.path);
-  fs.mkdirSync(targetDir, { recursive: true });
+  const repos = effectiveRepoList.map((repo) => repo.path);
   const outputPath = path.join(targetDir, "changes.json");
-  fs.writeFileSync(outputPath, JSON.stringify({ diff_target: diffTargets.join(", "), repos, files, change_ids: changeIds }, null, 2));
+  const changesJson = {
+    diff_target: diffTargets.join(", "),
+    repos,
+    repo_args: effectiveRepoList,
+    cwd,
+    files,
+    change_ids: changeIds,
+  };
+  const changesText = buildChangesText(files);
+  const filesMapText = buildFilesMap(files);
   const textOutputPath = path.join(targetDir, "changes.txt");
-  fs.writeFileSync(textOutputPath, buildChangesText(files));
   const filesMapPath = path.join(targetDir, "files.txt");
-  fs.writeFileSync(filesMapPath, buildFilesMap(files));
   const excludedNote = excludedCount > 0 ? ", ノイズ除外 " + excludedCount + "件" : "";
+
+  let previousComments = null;
+  let remappedSteps = null;
+  let idMap = null;
+  let lostIds = null;
+  let newIds = null;
+  let addedStepOrder = null;
+  if (isFollow) {
+    previousComments = readJson(path.join(targetDir, "comments.json"), []);
+    const idMapResult = buildIdMap(previousChanges.files, files);
+    idMap = idMapResult.idMap;
+    lostIds = idMapResult.lostIds;
+    newIds = idMapResult.newIds;
+    remappedSteps = remapSteps(previousChanges.files, previousSteps.steps || [], idMap);
+    const fixStepCount = remappedSteps.filter((step) => /^修正\d+回目$/.test(step.title || "")).length;
+    const maxOrder = remappedSteps.reduce((largest, step) => Math.max(largest, step.order || 0), 0);
+    if (newIds.length > 0) {
+      addedStepOrder = maxOrder + 1;
+      remappedSteps.push({
+        order: addedStepOrder,
+        title: "修正" + (fixStepCount + 1) + "回目",
+        narration: "",
+        owns: foldIdsToRanges(newIds),
+        refs: [],
+      });
+    }
+  }
+
+  fs.mkdirSync(targetDir, { recursive: true });
+  if (isFollow) {
+    fs.writeFileSync(path.join(targetDir, "steps.prev.json"), JSON.stringify(previousSteps, null, 2));
+    fs.writeFileSync(path.join(targetDir, "comments.prev.json"), JSON.stringify(previousComments, null, 2));
+  }
+  fs.writeFileSync(outputPath, JSON.stringify(changesJson, null, 2));
+  fs.writeFileSync(textOutputPath, changesText);
+  fs.writeFileSync(filesMapPath, filesMapText);
   console.log("生成: " + outputPath + " と " + textOutputPath + " と " + filesMapPath + " (変更ID " + changeIds.length + "件, ファイル " + files.length + "件, リポジトリ " + repos.length + "件" + excludedNote + ")");
+  if (!isFollow) return;
+  fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify(Object.assign({}, previousSteps, { steps: remappedSteps }), null, 2));
+  fs.writeFileSync(path.join(targetDir, "comments.json"), JSON.stringify(remapComments(previousComments, idMap), null, 2));
+  fs.writeFileSync(path.join(targetDir, "follow.json"), JSON.stringify({
+    at: new Date().toISOString(),
+    diff_target: changesJson.diff_target,
+    id_map: Object.fromEntries(idMap),
+    lost_ids: lostIds,
+    new_ids: newIds,
+    added_step_order: addedStepOrder,
+  }, null, 2));
+  const sameAsBefore = lostIds.length === 0 && newIds.length === 0;
+  const hasRangeArgs = effectiveRepoList.some((repo) => repo.diffArgs.length > 0);
+  const sameAsBeforeNote = sameAsBefore ? "。前回と同じ差分です" + (hasRangeArgs ? "。範囲を指定しているときは修正をコミットしないと反映されません" : "") : "";
+  console.log("追従: 引き継ぎ " + idMap.size + "件, 消えた行 " + lostIds.length + "件, 増えた行 " + newIds.length + "件" + sameAsBeforeNote);
 }
 
 // owns_files のパスを、そのファイルの全変更IDに展開する
@@ -419,6 +580,7 @@ function writeServeInfo(targetDir, info) {
 }
 
 function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
+  let followRunning = false;
   const server = http.createServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/health") {
@@ -450,6 +612,37 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
       if (request.method === "POST" && request.url === "/close") {
         fs.writeFileSync(path.join(targetDir, "close.flag"), new Date().toISOString());
         sendJson(response, 200, { closed: true });
+        return;
+      }
+      if (request.method === "POST" && request.url === "/follow") {
+        if (followRunning) {
+          sendJson(response, 409, { started: false, error: "差分の取り込みが実行中です" });
+          return;
+        }
+        let logFd = null;
+        try {
+          logFd = fs.openSync(path.join(targetDir, "serve.log"), "a");
+          const followCwd = readJson(path.join(targetDir, "changes.json"), {}).cwd || process.cwd();
+          const child = spawn(process.execPath, [__filename, "prep", path.resolve(targetDir)], { cwd: followCwd, stdio: ["ignore", logFd, logFd], detached: true });
+          followRunning = true;
+          let stopped = false;
+          const stopFollowing = () => {
+            if (stopped) return;
+            stopped = true;
+            followRunning = false;
+            fs.closeSync(logFd);
+          };
+          child.on("error", (error) => {
+            fs.writeSync(logFd, "prep起動失敗: " + String(error && error.message ? error.message : error) + "\n");
+            stopFollowing();
+          });
+          child.on("exit", stopFollowing);
+          child.unref();
+        } catch (error) {
+          if (logFd != null) fs.closeSync(logFd);
+          throw error;
+        }
+        sendJson(response, 200, { started: true });
         return;
       }
       response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
@@ -539,11 +732,13 @@ function startServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
 }
 
 const VIEWER_SCRIPT = `
-var story=null, stepIndex=0, commentsByKey={};
+var story=null, stepIndex=0, commentsByKey={}, lostCommentsByStep={};
 // 表示の種類 unified か split。既定は左右並列。stepを移動しても保つ
 var viewMode='split';
 // 変更行の周囲に残す無変更行の数
 var CONTEXT_LINES=3;
+// 差分を取り込むボタンを再度押せるようにするまでの待ち時間
+var FOLLOW_COOLDOWN_MSEC=5000;
 
 function esc(text){var div=document.createElement('div');div.textContent=text==null?'':String(text);return div.innerHTML;}
 // 先にHTMLエスケープしてから \`code\` と **強調** を効かせる
@@ -585,7 +780,17 @@ function commentKey(file, changeId){return file + '#' + changeId;}
 function stepNumber(step, index){return step.order!=null?step.order:index+1;}
 function indexComments(){
   commentsByKey={};
+  lostCommentsByStep={};
+  var stepOrders=(story.steps||[]).map(function(step, index){return stepNumber(step, index);});
+  var lastStepOrder=stepOrders.length?stepOrders[stepOrders.length-1]:null;
   (story.comments||[]).forEach(function(comment){
+    if(comment.change_id==null){
+      var stepOrder=comment.step_order;
+      if(lastStepOrder!=null&&stepOrders.indexOf(stepOrder)===-1) stepOrder=lastStepOrder;
+      if(!lostCommentsByStep[stepOrder]) lostCommentsByStep[stepOrder]=[];
+      lostCommentsByStep[stepOrder].push(comment);
+      return;
+    }
     var key=commentKey(comment.file, comment.change_id);
     if(!commentsByKey[key]) commentsByKey[key]=[];
     commentsByKey[key].push(comment);
@@ -655,6 +860,7 @@ function renderComment(comment){
 }
 function openForm(row, line, file, stepOrder){
   if(row.nextSibling&&row.nextSibling.className==='comment-form') return;
+  var openedMinimapSignature=minimapSignature;
   var form=document.createElement('div');
   form.className='comment-form';
   var input=document.createElement('input');
@@ -664,6 +870,13 @@ function openForm(row, line, file, stepOrder){
   sendButton.onclick=function(){
     var body=input.value.trim();
     if(!body) return;
+    if(minimapSignature!==openedMinimapSignature){
+      form.parentNode.removeChild(form);
+      var msg=document.getElementById('doneMsg');
+      msg.textContent='差分が更新されたためコメント欄を閉じました。もう一度開いて書いてください';
+      msg.style.display='block';
+      return;
+    }
     var payload={change_id:line.id, file:file, line:(line.new==null?line.old:line.new), step_order:stepOrder, body:body};
     fetch('/comments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
       .then(function(res){return res.json();})
@@ -907,15 +1120,15 @@ function renderSplitCode(code, file, stepOrder, ownsSet, refsSet, visible){
     }
   }
 }
-var mmBuilt=false, mmOrder=[], mmIndexById={}, mmStepById={};
+var minimapBuiltSignature=null, mmStepById={};
 const MM_SCALE = 0.15;
 
 function buildMinimap(){
   var inner=document.getElementById('minimapInner');
-  if(mmBuilt) return;
+  if(minimapBuiltSignature===minimapSignature) return;
   inner.innerHTML='';
 
-  mmOrder=[]; mmIndexById={}; mmStepById={};
+  mmStepById={};
   (story.steps||[]).forEach(function(step, stepPosition){
     (step.owns||[]).forEach(function(id){ mmStepById[id]=stepPosition; });
   });
@@ -927,10 +1140,6 @@ function buildMinimap(){
   (story.files||[]).forEach(function(file){
     html += '<div class="mm-file" data-filename="'+esc(file.file)+'"><div class="mm-file-code">';
     file.lines.forEach(function(line){
-      if(line.id != null) {
-        mmOrder.push(line.id);
-        mmIndexById[line.id] = mmOrder.length - 1;
-      }
       var cls = line.kind === 'add' ? 'mm-add' : (line.kind === 'del' ? 'mm-del' : 'mm-ctx');
       html += '<div class="mm-line ' + cls + '" ' + (line.id != null ? 'data-id="'+line.id+'"' : '') + '>' + esc(line.text||' ') + '</div>';
     });
@@ -948,34 +1157,16 @@ function buildMinimap(){
 
   inner.appendChild(wrap);
 
-
-
   var band = document.createElement('div');
   band.id = 'mmViewport';
   band.className = 'mm-viewport';
   band.style.display = 'none';
   inner.appendChild(band);
-
-  mmBuilt=true;
-}
-
-function updateMinimapHighlight(ownsSet, refsSet){
-  if(!mmBuilt) return;
-  var lines = document.querySelectorAll('.mm-full-diff .mm-line[data-id]');
-  lines.forEach(function(line) {
-    var id = line.dataset.id;
-    if(ownsSet[id]) {
-      line.className = line.className.replace(/ mm-own| mm-ref/g, '') + ' mm-own';
-    } else if (refsSet[id]) {
-      line.className = line.className.replace(/ mm-own| mm-ref/g, '') + ' mm-ref';
-    } else {
-      line.className = line.className.replace(/ mm-own| mm-ref/g, '');
-    }
-  });
+  minimapBuiltSignature=minimapSignature;
 }
 
 function updateMinimapViewport(){
-  if(!mmBuilt) return;
+  if(!minimapBuiltSignature) return;
   var cells = document.querySelectorAll('#diff .line[data-id]');
   var windowHeight = window.innerHeight;
   var topId = null, bottomId = null;
@@ -1010,7 +1201,7 @@ function updateMinimapViewport(){
 }
 
 function minimapJump(clientY){
-  if(!mmBuilt) return;
+  if(!minimapBuiltSignature) return;
   var inner = document.getElementById('minimapInner');
   var rect = inner.getBoundingClientRect();
   var clickY = clientY - rect.top + inner.scrollTop;
@@ -1058,11 +1249,40 @@ function render(){
   orderedFiles(shownFiles, step, ownsSet).forEach(function(file){
     diff.appendChild(renderFile(file, step, ownsSet, refsSet));
   });
+  var lostComments=lostCommentsByStep[stepNumber(step, stepIndex)]||[];
+  if(lostComments.length){
+    var lostBox=document.createElement('div');
+    lostBox.className='file';
+    var lostHeading=document.createElement('div');
+    lostHeading.className='file-head lost-comments-heading';
+    lostHeading.textContent='修正で無くなった行へのコメント';
+    lostBox.appendChild(lostHeading);
+    lostComments.forEach(function(comment){lostBox.appendChild(renderComment(comment));});
+    diff.appendChild(lostBox);
+  }
   buildMinimap();
   updateMinimapViewport();
 }
 document.getElementById('prevBtn').onclick=function(){if(stepIndex>0){stepIndex--;render();window.scrollTo(0,0);}};
 document.getElementById('nextBtn').onclick=function(){if(stepIndex<story.steps.length-1){stepIndex++;render();window.scrollTo(0,0);}};
+document.getElementById('followBtn').onclick=function(){
+  var followBtn=document.getElementById('followBtn');
+  var msg=document.getElementById('doneMsg');
+  followBtn.disabled=true;
+  msg.textContent='差分を取り込んでいます';
+  msg.style.display='block';
+  fetch('/follow',{method:'POST'}).then(function(response){
+    return response.json().then(function(body){
+      if(!response.ok) throw new Error(body.error||'差分の取り込みに失敗しました');
+      msg.textContent='差分の取り込みを始めました。まもなく反映されます';
+      setTimeout(function(){followBtn.disabled=false;}, FOLLOW_COOLDOWN_MSEC);
+    });
+  }).catch(function(error){
+    msg.textContent=error instanceof TypeError?'差分の取り込みに失敗しました。サーバが起動しているか確認してください':error.message;
+    msg.style.display='block';
+    followBtn.disabled=false;
+  });
+};
 document.getElementById('doneBtn').onclick=function(){
   fetch('/done',{method:'POST'}).then(function(){
     var msg=document.getElementById('doneMsg');
@@ -1087,7 +1307,7 @@ document.getElementById('unifiedBtn').onclick=function(){setViewMode('unified');
 document.getElementById('splitBtn').onclick=function(){setViewMode('split');};
 document.querySelector('.minimap').onclick=function(event){minimapJump(event.clientY);};
 document.querySelector('.minimap').addEventListener('mousemove', function(event){
-  if(!mmBuilt) return;
+  if(!minimapBuiltSignature) return;
   var inner = document.getElementById('minimapInner');
   var rect = inner.getBoundingClientRect();
   var clickY = event.clientY - rect.top + inner.scrollTop;
@@ -1128,23 +1348,41 @@ document.addEventListener('keydown', function(event){
   if(event.key==='ArrowLeft'&&stepIndex>0){stepIndex--;render();window.scrollTo(0,0);}
   if(event.key==='ArrowRight'&&stepIndex<story.steps.length-1){stepIndex++;render();window.scrollTo(0,0);}
 });
-// コメントと返信の数を並べた文字列。変化の検知に使う
-function commentsFingerprint(){
-  var comments=story.comments||[];
-  return comments.length+'#'+comments.map(function(comment){return (comment.replies||[]).length;}).join(',');
+// ステップの番号とownsの中身、変更IDの件数を並べた文字列。ミニマップの中身はこれだけで決まる
+function minimapFingerprint(){
+  var stepPart=(story.steps||[]).map(function(step){return step.order+':'+(step.owns||[]).join(',');}).join('|');
+  var changePart=(story.change_ids||[]).length;
+  return stepPart+'@'+changePart;
 }
-var commentsSignature='';
+// ミニマップ用の指紋に題名・タイトル・説明文・refsの件数・コメントと返信の件数を加えた文字列。差分や追従、説明文の書き換えによる変化の検知に使う
+function storyFingerprint(minimapPart){
+  var stepPart=(story.steps||[]).map(function(step){return step.order+':'+step.title+':'+step.narration+':'+(step.refs||[]).length;}).join('|');
+  var comments=story.comments||[];
+  var commentPart=comments.length+'#'+comments.map(function(comment){return (comment.replies||[]).length;}).join(',');
+  return minimapPart+'@'+story.title+'@'+stepPart+'@'+commentPart;
+}
+var storySignature='';
+var minimapSignature='';
 fetch('/story.json').then(function(res){return res.json();}).then(function(data){
-  story=data; indexComments(); commentsSignature=commentsFingerprint(); render();
+  story=data; indexComments();
+  minimapSignature=minimapFingerprint();
+  storySignature=storyFingerprint(minimapSignature);
+  render();
 });
-// AI の返信を拾うため story.json を定期取得し、変化があれば再描画する
+// AI の返信や追従による差分・ステップの変化を拾うため story.json を定期取得し、変化があれば再描画する
 setInterval(function(){
   fetch('/story.json').then(function(res){return res.json();}).then(function(data){
     story=data; indexComments();
-    var latest=commentsFingerprint();
-    if(latest===commentsSignature) return;
+    if((story.steps||[]).length>0){
+      if(stepIndex>=story.steps.length) stepIndex=story.steps.length-1;
+      if(stepIndex<0) stepIndex=0;
+    }
+    var latestMinimap=minimapFingerprint();
+    minimapSignature=latestMinimap;
+    var latest=storyFingerprint(latestMinimap);
+    if(latest===storySignature) return;
     if(document.querySelector('.comment-form')) return;
-    commentsSignature=latest;
+    storySignature=latest;
     var scrollY=window.scrollY;
     render();
     window.scrollTo(0, scrollY);
@@ -1282,6 +1520,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 .reply-body{white-space:normal;line-height:1.6}
 .comment-form{margin:4px 12px 8px 46px;display:flex;gap:8px}
 .comment-form input{flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:13px}
+.lost-comments-heading{font-size:13px;font-weight:600;color:var(--text-soft)}
 @media (prefers-color-scheme: dark){
   :root{
     --text-main:#e6edf3;
@@ -1314,8 +1553,6 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 .mm-ctx { opacity: 0.25; }
 .mm-add { background: #e6ffec; color: #1a7f37; }
 .mm-del { background: #ffebe9; color: #cf222e; }
-.mm-line.mm-own { border-left-color: var(--accent); background: var(--accent-soft); opacity: 1; }
-.mm-line.mm-ref { border-left-color: #d4a72c; opacity: 0.8; }
 .mm-viewport { position: absolute; left: 0; right: 0; background: rgba(61, 90, 254, 0.12); border-top: 3px solid rgba(61, 90, 254, 0.6); border-bottom: 3px solid rgba(61, 90, 254, 0.6); z-index: 10; pointer-events: none; transition: top 0.1s, height 0.1s; }
 .minimap-inner { position: relative; height: 100%; width: 100%; overflow-y: auto; overflow-x: hidden; scrollbar-width: none; cursor: pointer; }
 .minimap-inner::-webkit-scrollbar { display: none; }
@@ -1323,8 +1560,6 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 @media (prefers-color-scheme: dark) {
   .mm-add { background: #12261a; color: #3fb950; }
   .mm-del { background: #291416; color: #f85149; }
-  .mm-line.mm-own { background: #1b2440; border-left-color: #6c8cff; }
-
 }
 </style></head><body>
 <div class='sidebar'>
@@ -1342,6 +1577,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 <button id='splitBtn' class='view-toggle-btn active'>左右並列</button>
 </div>
 <span class='spacer'></span>
+<button id='followBtn'>差分を取り込む</button>
 <button id='doneBtn' class='done-btn'>レビュー完了</button>
 <button id='closeBtn'>終了</button>
 </div>
@@ -1504,3 +1740,9 @@ if (require.main === module) main();
 module.exports.buildFileDiffText = buildFileDiffText;
 module.exports.buildAskPrompt = buildAskPrompt;
 module.exports.askHaiku = askHaiku;
+module.exports.buildLineKeyIndex = buildLineKeyIndex;
+module.exports.buildIdMap = buildIdMap;
+module.exports.foldIdsToRanges = foldIdsToRanges;
+module.exports.remapSteps = remapSteps;
+module.exports.remapComments = remapComments;
+module.exports.runPrep = runPrep;
