@@ -36,6 +36,7 @@ storiff は story(お話)と diff(変更点)を合わせた名前。いま変更
    ```
 
 6. close.flag なら片付けて終わり。done.flag なら `<dir>/comments.json` を読み、haiku の返事で足りないコメントに答える。会話で答えつつ `node ${CLAUDE_PLUGIN_ROOT}/storiff.js reply <dir> <番号> "<本文>"` でも書く(番号は上から1・2…)。あわせて、直しが必要なやり取りだけを短くまとめて自分の理解に入れ、そのまま直す。ストーリーは作り直さない。答えたら `rm <dir>/done.flag` して 5 に戻り、close.flag まで繰り返す
+7. 手順6でコードを直したら `node ${CLAUDE_PLUGIN_ROOT}/storiff.js prep <dir>` をもう一度実行する。changes.json と steps.json がすでにあるので追従に切り替わり、直した差分は末尾の「修正N回目」ステップにまとまる。steps.json を作り直させたりはせず、追加された修正ステップの narration だけ、何をなぜ直したかを書いて `<dir>/steps.json` に足す。書いたら `node ${CLAUDE_PLUGIN_ROOT}/storiff.js check <dir>` を実行する。修正が大きいと「修正N回目」ステップが ng になるので、その場合はステップを割ってから ok になったことを確かめる。書いたら 5 に戻る
 
 ## サブエージェントに渡す prompt
 

@@ -3,23 +3,27 @@
 storiff.js(Node単一ファイル)とビューア、skill が共有する契約。
 
 ## 用語
-- 変更ID: 差分中の変更行(add/del)に振る通し番号。1始まり、差分の出現順。context行にはIDなし
+- 変更ID: 差分中の変更行(add/del)に振る通し番号。1始まり、ファイルの並び順で付く。自動生成ファイルは末尾に寄せてから番号を振る。context行にはIDなし
 - ステップ: ストーリーの1コマ。意図・ビジネスロジック単位で変更IDをまとめたもの
+- 追従: 2回目以降の prep が、前回の changes.json と steps.json を新しい差分に合わせて書き直すこと
 
 ## storiff.js の使い方
-- `node storiff.js prep <dir> [--repo P [範囲]]...` : `git diff` を解析し `<dir>/changes.json` と `<dir>/changes.txt` と `<dir>/files.txt` を書き出す。引数なしでカレントの作業差分。範囲(`main...HEAD` など)を後ろに付けられる。`--repo <path> [範囲]` を並べると複数リポジトリを1つにまとめ変更IDを通し番号にする。変更なしなら何も書かない
-- `node storiff.js check <dir>` : `steps.json` を検算し、抜けID・重複ID・不明ファイルを表示する。ok なら何も無い
+- `node storiff.js prep <dir> [--repo P [範囲]]...` : 差分を解析し `<dir>/changes.json` と `<dir>/changes.txt` と `<dir>/files.txt` を書き出す。差分の取得は引数なしなら `git diff HEAD`、範囲(`main...HEAD` など)を後ろに付ければ `git diff <範囲>`。ステージ済みの変更も差分に入る。`--repo <path> [範囲]` を並べると複数リポジトリを1つにまとめ変更IDを通し番号にする。変更なしなら何も書かない
+  - `<dir>` に `changes.json` と `steps.json` の両方がすでにあれば追従になる。どちらか欠けていれば初回として書き出す。詳しくは「追従」を参照
+- `node storiff.js check <dir>` : `steps.json` を検算し、抜けID・重複ID・不明ファイルを表示する。ok なら `ok: 全 N 件の変更IDがちょうど1回ずつ owns に入っています` と出す。1stepの変更行が目安(80行)を超えると参考として一覧に出し、目安の2倍を超えてかつ複数ファイルにまたがると ng になり分割を求める
 - `node storiff.js reply <dir> <コメント番号> <本文>` : comments.json の指定コメント(並び順1始まり)の `replies` に AI の返信を追記する
-- `node storiff.js serve <dir> [--port N] [--host H] [--session-id ID]` : changes.json と steps.json を読みビューアを配信しブラウザを開く。`--session-id` を渡すと、行コメントに haiku がその場で返信する。`<dir>/close.flag` で終了する(`done.flag` では止まらない)。バインド先は既定 127.0.0.1、`--host 0.0.0.0` で外部からホスト名で見られる
+- `node storiff.js serve <dir> [--port N] [--host H] [--session-id ID]` : ビューアを配信する常駐プロセスを裏で立ち上げ、URLだけすぐ返す。裏のプロセスは changes.json と steps.json を読み、`<dir>/close.flag` で終了する(`done.flag` では止まらない)。ログは `<dir>/serve.log`、起動情報は `<dir>/serve.json`(pid・port・host・url・sessionId)に書く。同じ dir でもう一度実行すると、serve.json の pid が生きていて `/health` に応答すれば新しく起動せず既存のビューアに接続する。`--daemon` は裏のプロセス自身が使う内部フラグ。`--session-id` を渡すと、行コメントに haiku がその場で返信する。バインド先は既定 127.0.0.1、`--host 0.0.0.0` で外部からホスト名で見られる
 - バインド先は `~/.storiff/config.json` の `host` でも指定できる(`{"host": "0.0.0.0"}`)。CLI の `--host` が優先
 
-依存は Node 組み込みのみ(http, fs, child_process, path, url)。Node 20+。
+依存は Node 組み込みのみ(http, fs, path, child_process, os)。Node 20+。`--session-id` を渡したときの行コメント返信(askHaiku)だけは外部の `claude` コマンドを子プロセスで呼ぶ。
 
 ## changes.json(prep が生成)
 ```json
 {
-  "diff_target": "working tree",
+  "diff_target": "HEAD",
   "repos": ["."],
+  "repo_args": [{"path": ".", "diffArgs": []}],
+  "cwd": "/path/to/repo",
   "files": [
     {
       "repo": ".",
@@ -38,6 +42,8 @@ storiff.js(Node単一ファイル)とビューア、skill が共有する契約�
 - text は行頭の +/-/空白マーカーを除いた本文
 - status は modified と added と deleted と renamed のどれか
 - repo はそのファイルが属するリポジトリのパス。単一リポジトリなら "."。複数でも変更IDは全体で通し番号
+- repo_args: prep に渡されたリポジトリと範囲の指定。追従で同じ範囲を再実行するために使う
+- cwd: 初回 prep を実行した場所。リポジトリのパスが相対指定のときの起点。追従では前回の値を引き継ぐ
 
 ## changes.txt(prep が生成、ストーリー作成時に読むスリム版)
 コンテキスト行を落とし、変更行(add と del)だけを持つ。
@@ -48,7 +54,8 @@ storiff.js(Node単一ファイル)とビューア、skill が共有する契約�
 ```
 - `-[id] ` または `+[id] ` 始まりが変更行。id は changes.json の change_ids と対応する
 - 複数リポジトリのときは見出しに repo が付く。例 `=== /path/to/repoB src/user.js (modified) ===`
-- ロックファイルやビルド成果物などのノイズは prep が除外する。既定は `*.lock` `package-lock.json` `*.min.js` `*.map` 等。`~/.storiff/config.json` の `exclude` で追加できる
+- ロックファイルやビルド成果物などのノイズは prep が除外する。既定は `*.lock` `package-lock.json` `yarn.lock` `pnpm-lock.yaml` `*.min.js` `*.min.css` `*.map`。`~/.storiff/config.json` の `exclude` で追加できる
+- 自動生成ファイルは除外せず、変更IDの並びで末尾に回すだけにする。既定は `*.generated.*` `*.gen.*` `*.pb.go`。`~/.storiff/config.json` の `generated` で追加できる
 
 ## files.txt(prep が生成、ファイル1行の地図)
 ファイルごとに変更IDの範囲と件数を1行で持つ。
@@ -76,11 +83,12 @@ F3 [53-236] (184) modified storiff.js
   - F番号 `"F12"` そのファイル1つ丸ごと
   - 範囲 `"53-90"` id の範囲。ファイルの一部を切り出す
   - 整数 `12` 単独の変更ID
-- owns_files: そのファイルの全変更IDを丸ごと所有する。同名ファイルが複数リポジトリにあるときは `repo::file` で書き分ける。owns と併用できる。並び順がビューアのファイル表示順になる
+- owns_files: そのファイルの全変更IDを丸ごと所有する。同名ファイルが複数リポジトリにあるときは `repo::file` で書き分ける。owns と併用できる。並び順がビューアのファイル表示順になる。この並び順が効くのは初回だけで、追従では owns_files が消えるため効かなくなる
 - file_notes: そのファイルへの一言説明。`{"パス": "短い説明"}`。同名ファイルが複数リポジトリにあるときだけ `repo::パス`。任意
-- refs: 既出コードの再言及。所有ではないので不変条件の対象外
+- refs: 既出コードの再言及。所有ではないので不変条件の対象外。書けるのは整数と範囲だけで、F番号は書けない。F番号を書くと追従で黙って落ちる
 - narration と file_notes は簡易 markdown が効く。`code`・**強調**・改行・行頭 - の箇条書き。生HTMLは書けない
 - narration の言語は固定しない。生成時に会話している言語を使う
+- 追従で書き直された後の owns は範囲文字列と整数だけになり、F番号と owns_files は残らない。詳しくは「追従」を参照
 
 ## ステップの分け方
 
@@ -96,6 +104,37 @@ F3 [53-236] (184) modified storiff.js
 8. narration には背景と理由を書く。そのステップだけで他人に説明できる分量にする。一文で終わらせない
 9. `node storiff.js check <dir>` で確認する。大きく複数ファイルにまたがるステップは ng になるので分割する
 
+## 追従(修正後の prep のやり直し)
+
+同じ `<dir>` にすでに changes.json と steps.json があるとき、prep をもう一度実行すると追従になる。どちらか欠けていれば初回として書き出す。コマンドは初回も追従も同じ。
+
+- 追従では引数で渡された範囲を使わず、前回の changes.json の repo_args を使う。渡し間違いで別の差分と対応表を作る事故を防ぐ
+- 前回と今回の差分を「リポジトリとパスと追加削除と行の中身」で照合し、旧IDと新IDの対応表を作る。同じ中身の行が複数あるときは出てきた順で対応させる
+- 対応の取れなかった旧IDは消えた行として owns から落ちる。owns が空になったステップも消さずに残り、ステップ番号は繰り上げない
+- 対応の取れなかった新IDは末尾の「修正N回目」ステップに入る。narration は空で、後で人か AI が書く
+- コメントの change_id も新IDに写る。写せないコメントは change_id が null になり、body と replies は残る。ビューアは「修正で無くなった行へのコメント」としてステップの末尾に出す。どのステップにも属さないコメントも最後のステップに寄る
+- 追従で差分が0件になったときは書き換えず、既存のストーリーをそのまま残す。ここで書き換えると全ステップの owns が空になるため
+
+追従で増えるファイル
+
+- steps.prev.json 書き換え前の steps.json の控え
+- comments.prev.json 書き換え前の comments.json の控え
+- follow.json 旧IDと新IDの対応表、消えたID、増えたID、足した修正ステップの番号
+
+控えは直前の1回分だけ残る。追従を重ねるたびに上書きされるので、最初の状態には戻れない
+
+CLI から直接 prep を叩く経路と、ビューアの「差分を取り込む」ボタンからの追従(POST /follow)は、同時に走らせない。控えのファイルが書き換え済みの内容で上書きされて失われる。
+
+### 追従の限界
+
+- 範囲を指定してレビューを始めたときは、修正をコミットしないと追従に出てこない
+- 新しく作ったファイルは `git add` するまで差分に入らない
+- ファイル名を変えるとそのファイルのストーリーは白紙に戻る
+- ストーリーに入っている行の中身を書き換えると、その行は元のステップから抜けて末尾の修正ステップに移る。元のステップの説明はその行を説明しなくなる
+- 同じ中身の変更行が1ファイルに複数あるとき、同じ文字列の行を手前に足すとその塊の対応が1つずれる。ずれる先は必ず同じ文字列の行だが、閉じ括弧や空行のような重複しやすい行では起きやすい
+- owns が空になったステップは残り、画面では説明だけで差分が出ない状態になる
+- 「修正N回目」の連番は title の文字列から数えている。title を書き換えると番号が重なる
+
 ## story.json(serve が配信 = changes と steps をマージしたもの)
 ```json
 {
@@ -103,7 +142,7 @@ F3 [53-236] (184) modified storiff.js
   "files": [ ... ],
   "change_ids": [ ... ],
   "steps": [ ... ],
-  "validation": {"ok": true, "missing": [], "duplicated": []},
+  "validation": {"ok": true, "missing": [], "duplicated": [], "unknown_files": []},
   "comments": [ ... ]
 }
 ```
@@ -112,11 +151,13 @@ F3 [53-236] (184) modified storiff.js
 ## HTTP API(serve)
 | メソッド | パス | 内容 |
 | --- | --- | --- |
+| GET | /health | 生存確認。`{"pid": ...}` を返す。serve を2回目に起動したとき既存プロセスの生死を確かめるのに使う |
 | GET | / | ビューアHTML(storiff.js に埋め込み) |
 | GET | /story.json | マージ済みのストーリーと validation と comments |
 | POST | /comments | 行コメント追記。`<dir>/comments.json` に追記 |
 | POST | /done | `<dir>/done.flag` を書く。skill はこれを合図に返信する。serve は止めない |
 | POST | /close | `<dir>/close.flag` を書く。serve はこれで終了する |
+| POST | /follow | 追従の prep を子プロセスで実行する。すでに実行中なら 409 を返す |
 
 POST /comments の body
 ```json
@@ -130,8 +171,9 @@ comments.json は上記に `replies` と `at`(ISO文字列)を足した配列。
 - そのステップの owns を含むファイルだけ差分表示。owns行を強調、他の変更行は淡く、refs行は副次強調。離れた無変更行は「⋯ N 行 ⋯」に畳む
 - 差分は左右並列(split)が既定。統合(unified)と切り替えるトグルがあり、選択はステップ移動後も保つ
 - ファイル見出しにパスと status。複数リポジトリのときは repo をタグ表示。file_notes は見出しの下に出す
-- 行クリックでコメント欄。送信で POST /comments。AIの返信は各コメントの下にスレッドで積む
-- /story.json を数秒ごとに取得し、コメントや返信が増えたときだけ再描画する。コメント欄を開いている間は再描画しない
+- 行クリックでコメント欄。送信で POST /comments。AIの返信は各コメントの下にスレッドで積む。コメント欄を開いた後に追従が入って差分が変わっていたら、送信時に欄を閉じて開き直すよう伝える
+- 固定ヘッダーに「差分を取り込む」ボタンがある。押すと POST /follow で追従の prep を走らせ、押したことと取り込みが始まったことをメッセージで示す。押した直後には描き直さず、定期取得が変化を拾うのに任せる。追従が動いている間は次の押下がサーバ側で断られる
+- /story.json を数秒ごとに取得し、差分やステップやコメントや返信が変わったときだけ再描画する。ミニマップも組み直す。見ているステップ位置とスクロール位置は保つ。コメント欄を開いている間は再描画しない
 - 「レビュー完了」で POST /done、「終了」で POST /close
 - validation.ok が false なら missing/duplicated/unknown_files を警告バナー表示
 - add=緑、del=赤の配色で、OSの設定に合わせてダークモードにも切り替わる
