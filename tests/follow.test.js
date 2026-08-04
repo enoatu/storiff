@@ -4,7 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
-const { buildIdMap, foldIdsToRanges, remapSteps, remapComments, runPrep } = require("../storiff.js");
+const { buildIdMap, foldIdsToRanges, remapSteps, remapComments, runPrep, resolveSteps, buildValidation } = require("../storiff.js");
 
 function makeTempDir(prefix) {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
@@ -45,13 +45,13 @@ function idsFromOwns(owns) {
 }
 
 function textById(changes) {
-  const map = new Map();
+  const textByIdMap = new Map();
   for (const file of changes.files) {
     for (const line of file.lines) {
-      if (line.id != null) map.set(line.id, line.text);
+      if (line.id != null) textByIdMap.set(line.id, line.text);
     }
   }
-  return map;
+  return textByIdMap;
 }
 
 test("行が動かないとき、旧IDと新IDが1対1で対応する", () => {
@@ -475,4 +475,262 @@ test("cwdを持たない古いchanges.jsonでも追従がクラッシュせず�
   const secondSteps = JSON.parse(fs.readFileSync(path.join(targetDir, "steps.json"), "utf8"));
   assert.strictEqual(secondChanges.cwd, repoDir);
   assert.strictEqual(secondSteps.steps.some((step) => step.title === "修正1回目"), true);
+});
+
+test("A1 同じ内容の行が手前に増えても、既存ステップのownsが元と同じ意味の行を指し続ける", () => {
+  const previousFiles = [makeFile(".", "x.js", [
+    makeLine("add", "func A", 1),
+    makeLine("add", "}", 2),
+    makeLine("add", "mid", 3),
+    makeLine("add", "func B", 4),
+    makeLine("add", "}", 5),
+  ])];
+  const currentFiles = [makeFile(".", "x.js", [
+    makeLine("add", "func Z", 1),
+    makeLine("add", "}", 2),
+    makeLine("add", "func A", 3),
+    makeLine("add", "}", 4),
+    makeLine("add", "mid", 5),
+    makeLine("add", "func B", 6),
+    makeLine("add", "}", 7),
+  ])];
+  const previousSteps = [
+    { order: 1, title: "ステップ1", narration: "説明", owns: [1, 2], refs: [] },
+    { order: 2, title: "ステップ2", narration: "説明", owns: [3, 4, 5], refs: [] },
+  ];
+  const { idMap, newIds } = buildIdMap(previousFiles, currentFiles);
+  const remapped = remapSteps(previousFiles, previousSteps, idMap);
+  const currentTextById = textById({ files: currentFiles });
+
+  const step1Texts = idsFromOwns(remapped[0].owns).map((id) => currentTextById.get(id));
+  assert.deepStrictEqual(step1Texts, ["func A", "}"]);
+
+  const step2Texts = idsFromOwns(remapped[1].owns).map((id) => currentTextById.get(id));
+  assert.deepStrictEqual(step2Texts, ["mid", "func B", "}"]);
+
+  const newTexts = newIds.map((id) => currentTextById.get(id)).sort();
+  assert.deepStrictEqual(newTexts, ["func Z", "}"].sort());
+});
+
+test("A2 追従で範囲文字列になったrefsも、resolveStepsで整数の配列になり行のidと一致する", () => {
+  const files = [makeFile(".", "a.js", [makeLine("add", "x", 1), makeLine("add", "y", 2), makeLine("add", "z", 3)])];
+  const steps = [{ order: 1, title: "タイトル", narration: "説明", owns: [1], refs: ["2-3"] }];
+  const { resolvedSteps } = resolveSteps(files, steps);
+  assert.deepStrictEqual(resolvedSteps[0].refs, [2, 3]);
+});
+
+test("A3 steps.jsonが無くてもchanges.jsonのrepo_argsで記録した範囲が使われる", (t) => {
+  const originalCwd = process.cwd();
+  const repoDir = makeTempDir("storiff-repo-");
+  const targetDir = makeTempDir("storiff-target-");
+  t.after(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(targetDir, { recursive: true, force: true });
+  });
+
+  makeGitRepo(repoDir);
+  commitFile(repoDir, "a.js", "line1\n", "first");
+  commitFile(repoDir, "a.js", "line1\nline2\n", "second");
+
+  process.chdir(repoDir);
+  runPrep(targetDir, [{ path: ".", diffArgs: ["HEAD~1"] }]);
+  const firstChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  assert.strictEqual(firstChanges.diff_target, "HEAD~1");
+  assert.strictEqual(fs.existsSync(path.join(targetDir, "steps.json")), false);
+
+  fs.writeFileSync(path.join(repoDir, "a.js"), "line1\nline2\nline3\n");
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+
+  const secondChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  assert.strictEqual(secondChanges.diff_target, "HEAD~1");
+});
+
+test("A4 changes.jsonからfilesが消えていても追従がクラッシュせず1行で終わる", (t) => {
+  const originalCwd = process.cwd();
+  const repoDir = makeTempDir("storiff-repo-");
+  const targetDir = makeTempDir("storiff-target-");
+  t.after(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(targetDir, { recursive: true, force: true });
+  });
+
+  makeGitRepo(repoDir);
+  commitFile(repoDir, "a.js", "line1\n", "first");
+  fs.writeFileSync(path.join(repoDir, "a.js"), "line1\nline2\n");
+
+  process.chdir(repoDir);
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  const firstChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify({
+    steps: [{ order: 1, title: "タイトル", narration: "説明", owns: firstChanges.change_ids, refs: [] }],
+  }));
+
+  delete firstChanges.files;
+  fs.writeFileSync(path.join(targetDir, "changes.json"), JSON.stringify(firstChanges));
+  const changesBefore = fs.readFileSync(path.join(targetDir, "changes.json"), "utf8");
+  const stepsBefore = fs.readFileSync(path.join(targetDir, "steps.json"), "utf8");
+
+  fs.writeFileSync(path.join(repoDir, "a.js"), "line1\nline2\nline3\n");
+
+  const originalLog = console.log;
+  const loggedLines = [];
+  console.log = (message) => loggedLines.push(message);
+  t.after(() => { console.log = originalLog; });
+
+  assert.doesNotThrow(() => runPrep(targetDir, [{ path: ".", diffArgs: [] }]));
+
+  console.log = originalLog;
+  assert.strictEqual(loggedLines.length, 1);
+  assert.strictEqual(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"), changesBefore);
+  assert.strictEqual(fs.readFileSync(path.join(targetDir, "steps.json"), "utf8"), stepsBefore);
+});
+
+test("A5 stepsが空のsteps.jsonで追従したとき、追従後にcheckがokになる", (t) => {
+  const originalCwd = process.cwd();
+  const repoDir = makeTempDir("storiff-repo-");
+  const targetDir = makeTempDir("storiff-target-");
+  t.after(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(targetDir, { recursive: true, force: true });
+  });
+
+  makeGitRepo(repoDir);
+  commitFile(repoDir, "a.js", "line1\n", "first");
+  fs.writeFileSync(path.join(repoDir, "a.js"), "line1\nline2\n");
+
+  process.chdir(repoDir);
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify({ steps: [] }));
+
+  fs.writeFileSync(path.join(repoDir, "a.js"), "line1\nline2\nline3\n");
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+
+  const secondChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  const secondSteps = JSON.parse(fs.readFileSync(path.join(targetDir, "steps.json"), "utf8"));
+  const validation = buildValidation(secondChanges.change_ids, secondChanges.files, secondSteps.steps);
+  assert.strictEqual(validation.ok, true);
+});
+
+test("A6 同じ内容の行が1万本あっても、追従が現実的な時間で終わる", (t) => {
+  const originalCwd = process.cwd();
+  const repoDir = makeTempDir("storiff-repo-");
+  const targetDir = makeTempDir("storiff-target-");
+  t.after(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(targetDir, { recursive: true, force: true });
+  });
+
+  const sameLines = Array.from({ length: 10000 }, () => "}").join("\n") + "\n";
+
+  makeGitRepo(repoDir);
+  commitFile(repoDir, "a.js", "before\n", "first");
+  fs.writeFileSync(path.join(repoDir, "a.js"), "before\n" + sameLines);
+
+  process.chdir(repoDir);
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  const firstChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify({
+    steps: [{ order: 1, title: "タイトル", narration: "説明", owns: firstChanges.change_ids, refs: [] }],
+  }));
+
+  fs.writeFileSync(path.join(repoDir, "a.js"), "before\n" + sameLines + "newLine\n");
+
+  const startedAt = Date.now();
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  const elapsedMsec = Date.now() - startedAt;
+
+  assert.ok(elapsedMsec < 5000, "追従に " + elapsedMsec + "ms かかった");
+});
+
+test("B1 閾値を超える同じ内容の行が絡み写像が恒等でないとき、前回と同じ差分と判定されずstepsが正しい行を指す", (t) => {
+  const originalCwd = process.cwd();
+  const repoDir = makeTempDir("storiff-repo-");
+  const targetDir = makeTempDir("storiff-target-");
+  t.after(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(targetDir, { recursive: true, force: true });
+  });
+
+  const closingBraces = Array.from({ length: 101 }, () => "}").join("\n");
+
+  makeGitRepo(repoDir);
+  commitFile(repoDir, "a.js", "", "first");
+  fs.writeFileSync(path.join(repoDir, "a.js"), "func A\n" + closingBraces + "\n");
+
+  process.chdir(repoDir);
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  const firstChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  assert.strictEqual(firstChanges.change_ids.length, 102);
+  fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify({
+    steps: [
+      { order: 1, title: "funcAを定義する", narration: "説明", owns: [1], refs: [] },
+      { order: 2, title: "閉じ括弧", narration: "説明", owns: ["2-102"], refs: [] },
+    ],
+  }));
+
+  fs.writeFileSync(path.join(repoDir, "a.js"), closingBraces + "\nfunc A\n");
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+
+  const secondChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  const secondSteps = JSON.parse(fs.readFileSync(path.join(targetDir, "steps.json"), "utf8"));
+  const lineTextById = textById(secondChanges);
+
+  const funcAStep = secondSteps.steps.find((step) => step.title === "funcAを定義する");
+  const funcATexts = idsFromOwns(funcAStep.owns).map((id) => lineTextById.get(id));
+  assert.deepStrictEqual(funcATexts, ["func A"]);
+});
+
+test("B2 引数で範囲を明示し直すと記録済みではなく新しい範囲が使われる", (t) => {
+  const originalCwd = process.cwd();
+  const repoDir = makeTempDir("storiff-repo-");
+  const targetDir = makeTempDir("storiff-target-");
+  t.after(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(targetDir, { recursive: true, force: true });
+  });
+
+  makeGitRepo(repoDir);
+  commitFile(repoDir, "a.js", "line1\n", "first");
+  commitFile(repoDir, "a.js", "line1\nline2\n", "second");
+  fs.writeFileSync(path.join(repoDir, "a.js"), "line1\nline2\nline3\n");
+
+  process.chdir(repoDir);
+  runPrep(targetDir, [{ path: ".", diffArgs: ["HEAD~1"] }], true);
+  const firstChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  assert.strictEqual(firstChanges.diff_target, "HEAD~1");
+
+  runPrep(targetDir, [{ path: ".", diffArgs: ["HEAD"] }], true);
+  const secondChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  assert.strictEqual(secondChanges.diff_target, "HEAD");
+});
+
+test("B3 前回と同じ差分のとき、follow.jsonが新たに書かれない", (t) => {
+  const originalCwd = process.cwd();
+  const repoDir = makeTempDir("storiff-repo-");
+  const targetDir = makeTempDir("storiff-target-");
+  t.after(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(targetDir, { recursive: true, force: true });
+  });
+
+  makeGitRepo(repoDir);
+  commitFile(repoDir, "a.js", "line1\n", "first");
+  fs.writeFileSync(path.join(repoDir, "a.js"), "line1\nline2\n");
+
+  process.chdir(repoDir);
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  const firstChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify({
+    steps: [{ order: 1, title: "タイトル", narration: "説明", owns: firstChanges.change_ids, refs: [] }],
+  }));
+
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  assert.strictEqual(fs.existsSync(path.join(targetDir, "follow.json")), false);
 });

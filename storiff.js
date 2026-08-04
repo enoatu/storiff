@@ -8,6 +8,9 @@ const os = require("os");
 // 1stepがおおよそ1時間の作業に収まる目安の変更行数。これを超えるstepは分割の候補
 const CHANGED_LINES_PER_STEP_GUIDE = 80;
 
+// 前回と今回のどちらかで同じ内容の行がこの本数を超えたら、単調増加列の候補から外し出現順に対応させる
+const SAME_CONTENT_LINE_COUNT_MAX = 100;
+
 // serve のデーモン起動を待つときのポーリング間隔と上限
 const SERVE_POLL_INTERVAL_MSEC = 200;
 const SERVE_START_TIMEOUT_MSEC = 10000;
@@ -15,6 +18,12 @@ const SERVE_START_TIMEOUT_MSEC = 10000;
 function readJson(filePath, fallback) {
   if (!fs.existsSync(filePath)) return fallback;
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
+}
+
+function writeFileAtomic(filePath, content) {
+  const tempPath = filePath + ".tmp" + process.pid + "-" + Date.now();
+  fs.writeFileSync(tempPath, content);
+  fs.renameSync(tempPath, filePath);
 }
 
 // ~/.storiff/config.json の既定値。CLI引数の方が優先される
@@ -131,31 +140,138 @@ function buildFilesMap(files) {
   return lines.join("\n") + "\n";
 }
 
+// リポジトリとファイルと行の種類と本文から、突き合わせ用のキーを組み立てる
+function buildLineKey(file, line) {
+  return [file.repo, file.file, line.kind, line.text].join("\0");
+}
+
 // 変更行のキーごとに変更IDの配列を返す。前回と今回の差分を突き合わせるための下準備
 function buildLineKeyIndex(files) {
-  const keyToIds = new Map();
+  const keyToIdsMap = new Map();
   for (const file of files) {
     for (const line of file.lines) {
       if (line.id == null) continue;
-      const key = [file.repo, file.file, line.kind, line.text].join("\0");
-      if (!keyToIds.has(key)) keyToIds.set(key, []);
-      keyToIds.get(key).push(line.id);
+      const key = buildLineKey(file, line);
+      if (!keyToIdsMap.has(key)) keyToIdsMap.set(key, []);
+      keyToIdsMap.get(key).push(line.id);
     }
   }
-  return keyToIds;
+  return keyToIdsMap;
+}
+
+// 値の列を先頭から見て、そこまでの狭義単調増加列の長さを1つずつ返す
+function computeChainLengths(values) {
+  const pileTops = [];
+  const lengths = [];
+  for (const value of values) {
+    let low = 0;
+    let high = pileTops.length;
+    while (low < high) {
+      const mid = (low + high) >> 1;
+      if (pileTops[mid] < value) low = mid + 1;
+      else high = mid;
+    }
+    lengths.push(low + 1);
+    if (low === pileTops.length) pileTops.push(value);
+    else pileTops[low] = value;
+  }
+  return lengths;
+}
+
+// previousIdの昇順とcurrentIdの昇順が両方保たれる対応の中で、最も多く引き継げる組み合わせを選ぶ
+// 各候補について前から見た単調増加列の長さと後ろから見た単調増加列の長さを求め、
+// 両方を足した長さが全体の最大値と一致する候補だけを、previousId昇順・currentId昇順に選んでいく
+// 同じキーの候補が複数あっても、選べるcurrentIdのうち最も早いものが優先されるので前後関係が入れ替わらない
+// 同じ内容の行がSAME_CONTENT_LINE_COUNT_MAXを超えて並ぶキーは候補数が本数の掛け算で膨れ上がるため、
+// そのキーだけこの計算から外し、前回と今回の出現順どうしをそのまま対応させる
+function pickMonotonicIdMap(candidateGroups) {
+  const previousIdsByCurrentIds = new Map();
+  for (const group of candidateGroups) {
+    if (!previousIdsByCurrentIds.has(group.currentIds)) previousIdsByCurrentIds.set(group.currentIds, []);
+    previousIdsByCurrentIds.get(group.currentIds).push(group.previousId);
+  }
+
+  const idMap = new Map();
+  const monotonicGroups = [];
+  const resolvedCurrentIds = new Set();
+  for (const group of candidateGroups) {
+    const previousIds = previousIdsByCurrentIds.get(group.currentIds);
+    const isFrequentContent = previousIds.length > SAME_CONTENT_LINE_COUNT_MAX || group.currentIds.length > SAME_CONTENT_LINE_COUNT_MAX;
+    if (!isFrequentContent) {
+      monotonicGroups.push(group);
+      continue;
+    }
+    if (resolvedCurrentIds.has(group.currentIds)) continue;
+    resolvedCurrentIds.add(group.currentIds);
+    const sortedPreviousIds = [...previousIds].sort((left, right) => left - right);
+    const sortedCurrentIds = group.currentIds;
+    const pairCount = Math.min(sortedPreviousIds.length, sortedCurrentIds.length);
+    for (let index = 0; index < pairCount; index++) {
+      idMap.set(sortedPreviousIds[index], sortedCurrentIds[index]);
+    }
+  }
+
+  const forwardCandidates = [];
+  for (const group of monotonicGroups) {
+    for (const currentId of [...group.currentIds].reverse()) {
+      forwardCandidates.push({ previousId: group.previousId, currentId });
+    }
+  }
+  const forwardLengths = computeChainLengths(forwardCandidates.map((candidate) => candidate.currentId));
+
+  const backwardCandidates = [];
+  for (const group of [...monotonicGroups].reverse()) {
+    for (const currentId of group.currentIds) {
+      backwardCandidates.push({ previousId: group.previousId, currentId });
+    }
+  }
+  const backwardLengths = computeChainLengths(backwardCandidates.map((candidate) => -candidate.currentId));
+
+  const backwardLengthMap = new Map();
+  backwardCandidates.forEach((candidate, index) => {
+    backwardLengthMap.set(candidate.previousId + "," + candidate.currentId, backwardLengths[index]);
+  });
+  const combinedLengthMap = new Map();
+  forwardCandidates.forEach((candidate, index) => {
+    const key = candidate.previousId + "," + candidate.currentId;
+    combinedLengthMap.set(key, forwardLengths[index] + backwardLengthMap.get(key) - 1);
+  });
+
+  const maxLength = forwardLengths.reduce((largest, length) => Math.max(largest, length), 0);
+  let remaining = maxLength;
+  let lastCurrentId = -Infinity;
+  for (const group of monotonicGroups) {
+    if (remaining === 0) break;
+    for (const currentId of group.currentIds) {
+      if (currentId <= lastCurrentId) continue;
+      const key = group.previousId + "," + currentId;
+      if (combinedLengthMap.get(key) !== maxLength) continue;
+      if (backwardLengthMap.get(key) !== remaining) continue;
+      idMap.set(group.previousId, currentId);
+      lastCurrentId = currentId;
+      remaining -= 1;
+      break;
+    }
+  }
+  return idMap;
 }
 
 // 旧IDから新IDへの対応表を作る。前回だけにあったIDは lostIds、今回だけにあったIDは newIds に入る
 function buildIdMap(previousFiles, currentFiles) {
-  const previousIndex = buildLineKeyIndex(previousFiles);
-  const currentIndex = buildLineKeyIndex(currentFiles);
-  const idMap = new Map();
+  const currentKeyToIdsMap = buildLineKeyIndex(currentFiles);
+  const candidateGroups = [];
+  for (const file of previousFiles) {
+    for (const line of file.lines) {
+      if (line.id == null) continue;
+      const currentIds = currentKeyToIdsMap.get(buildLineKey(file, line));
+      if (currentIds) candidateGroups.push({ previousId: line.id, currentIds });
+    }
+  }
+  const idMap = pickMonotonicIdMap(candidateGroups);
   const lostIds = [];
-  for (const [key, previousIds] of previousIndex) {
-    const currentIds = currentIndex.get(key) || [];
-    for (const [index, previousId] of previousIds.entries()) {
-      if (index < currentIds.length) idMap.set(previousId, currentIds[index]);
-      else lostIds.push(previousId);
+  for (const file of previousFiles) {
+    for (const line of file.lines) {
+      if (line.id != null && !idMap.has(line.id)) lostIds.push(line.id);
     }
   }
   const takenIds = new Set(idMap.values());
@@ -165,7 +281,7 @@ function buildIdMap(previousFiles, currentFiles) {
       if (line.id != null && !takenIds.has(line.id)) newIds.push(line.id);
     }
   }
-  return { idMap, lostIds: lostIds.sort((left, right) => left - right), newIds };
+  return { idMap, lostIds, newIds };
 }
 
 // 連続する整数IDを範囲文字列に畳む。単独のIDは整数のまま返す
@@ -200,7 +316,7 @@ function remapSteps(previousFiles, stepList, idMap) {
   const resolved = resolveSteps(previousFiles, stepList);
   return resolved.resolvedSteps.map((step) => {
     const previousOwns = step.owns;
-    const previousRefs = expandOwns(step.refs || []);
+    const previousRefs = step.refs;
     const owns = previousOwns.map((id) => idMap.get(id)).filter((id) => id != null);
     const refs = previousRefs.map((id) => idMap.get(id)).filter((id) => id != null);
     const remapped = Object.assign({}, step, { owns: foldIdsToRanges(owns), refs: foldIdsToRanges(refs) });
@@ -235,16 +351,32 @@ function matchesFilePattern(filePath, patterns) {
   });
 }
 
-function runPrep(targetDir, repoList) {
-  const previousChanges = readJson(path.join(targetDir, "changes.json"), null);
+function runPrep(targetDir, repoList, hasExplicitArgs) {
+  const changesPath = path.join(targetDir, "changes.json");
+  let previousChanges = null;
+  if (fs.existsSync(changesPath)) {
+    try {
+      previousChanges = JSON.parse(fs.readFileSync(changesPath, "utf8"));
+    } catch (error) {
+      console.log("追従しません: 前回の changes.json が壊れています(" + String(error.message).split("\n")[0].trim() + ")");
+      return;
+    }
+    if (!Array.isArray(previousChanges.files) || previousChanges.files.some((file) => !Array.isArray(file.lines))) {
+      console.log("追従しません: 前回の changes.json に files がありません");
+      return;
+    }
+  }
   const previousSteps = readJson(path.join(targetDir, "steps.json"), null);
   const isFollow = previousChanges != null && previousSteps != null;
-  const effectiveRepoList = isFollow && previousChanges.repo_args ? previousChanges.repo_args : repoList;
-  const cwd = isFollow ? previousChanges.cwd || process.cwd() : process.cwd();
+  const hasPreviousChanges = previousChanges != null;
+  const usingRecordedRepoList = hasPreviousChanges && previousChanges.repo_args != null && !hasExplicitArgs;
+  if (usingRecordedRepoList) console.log("記録済みの範囲を使います: " + previousChanges.diff_target);
+  const effectiveRepoList = usingRecordedRepoList ? previousChanges.repo_args : repoList;
+  const cwd = usingRecordedRepoList ? previousChanges.cwd || process.cwd() : process.cwd();
   const collectedFiles = [];
   const diffTargets = [];
   for (const repo of effectiveRepoList) {
-    const repoPath = isFollow ? path.resolve(cwd, repo.path) : repo.path;
+    const repoPath = usingRecordedRepoList ? path.resolve(cwd, repo.path) : repo.path;
     const diffArgs = repo.diffArgs.length > 0 ? repo.diffArgs : ["HEAD"];
     let diffText;
     try {
@@ -308,6 +440,7 @@ function runPrep(targetDir, repoList) {
   let lostIds = null;
   let newIds = null;
   let addedStepOrder = null;
+  let isSameAsBefore = false;
   if (isFollow) {
     previousComments = readJson(path.join(targetDir, "comments.json"), []);
     const idMapResult = buildIdMap(previousChanges.files, files);
@@ -315,43 +448,51 @@ function runPrep(targetDir, repoList) {
     lostIds = idMapResult.lostIds;
     newIds = idMapResult.newIds;
     remappedSteps = remapSteps(previousChanges.files, previousSteps.steps || [], idMap);
+    const ownedIds = new Set();
+    for (const step of resolveSteps(files, remappedSteps).resolvedSteps) {
+      for (const id of step.owns) ownedIds.add(id);
+    }
+    const unownedIds = changeIds.filter((id) => !ownedIds.has(id));
     const fixStepCount = remappedSteps.filter((step) => /^修正\d+回目$/.test(step.title || "")).length;
     const maxOrder = remappedSteps.reduce((largest, step) => Math.max(largest, step.order || 0), 0);
-    if (newIds.length > 0) {
+    if (unownedIds.length > 0) {
       addedStepOrder = maxOrder + 1;
       remappedSteps.push({
         order: addedStepOrder,
         title: "修正" + (fixStepCount + 1) + "回目",
         narration: "",
-        owns: foldIdsToRanges(newIds),
+        owns: foldIdsToRanges(unownedIds),
         refs: [],
       });
     }
+    const isIdentityMap = [...idMap].every(([previousId, currentId]) => previousId === currentId);
+    isSameAsBefore = lostIds.length === 0 && newIds.length === 0 && isIdentityMap;
   }
 
   fs.mkdirSync(targetDir, { recursive: true });
-  if (isFollow) {
-    fs.writeFileSync(path.join(targetDir, "steps.prev.json"), JSON.stringify(previousSteps, null, 2));
-    fs.writeFileSync(path.join(targetDir, "comments.prev.json"), JSON.stringify(previousComments, null, 2));
+  if (isFollow && !isSameAsBefore) {
+    writeFileAtomic(path.join(targetDir, "steps.prev.json"), JSON.stringify(previousSteps, null, 2));
+    writeFileAtomic(path.join(targetDir, "comments.prev.json"), JSON.stringify(previousComments, null, 2));
   }
-  fs.writeFileSync(outputPath, JSON.stringify(changesJson, null, 2));
-  fs.writeFileSync(textOutputPath, changesText);
-  fs.writeFileSync(filesMapPath, filesMapText);
+  writeFileAtomic(outputPath, JSON.stringify(changesJson, null, 2));
+  writeFileAtomic(textOutputPath, changesText);
+  writeFileAtomic(filesMapPath, filesMapText);
   console.log("生成: " + outputPath + " と " + textOutputPath + " と " + filesMapPath + " (変更ID " + changeIds.length + "件, ファイル " + files.length + "件, リポジトリ " + repos.length + "件" + excludedNote + ")");
   if (!isFollow) return;
-  fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify(Object.assign({}, previousSteps, { steps: remappedSteps }), null, 2));
-  fs.writeFileSync(path.join(targetDir, "comments.json"), JSON.stringify(remapComments(previousComments, idMap), null, 2));
-  fs.writeFileSync(path.join(targetDir, "follow.json"), JSON.stringify({
-    at: new Date().toISOString(),
-    diff_target: changesJson.diff_target,
-    id_map: Object.fromEntries(idMap),
-    lost_ids: lostIds,
-    new_ids: newIds,
-    added_step_order: addedStepOrder,
-  }, null, 2));
-  const sameAsBefore = lostIds.length === 0 && newIds.length === 0;
+  if (!isSameAsBefore) {
+    writeFileAtomic(path.join(targetDir, "steps.json"), JSON.stringify(Object.assign({}, previousSteps, { steps: remappedSteps }), null, 2));
+    writeFileAtomic(path.join(targetDir, "comments.json"), JSON.stringify(remapComments(previousComments, idMap), null, 2));
+    writeFileAtomic(path.join(targetDir, "follow.json"), JSON.stringify({
+      at: new Date().toISOString(),
+      diff_target: changesJson.diff_target,
+      id_map: Object.fromEntries(idMap),
+      lost_ids: lostIds,
+      new_ids: newIds,
+      added_step_order: addedStepOrder,
+    }, null, 2));
+  }
   const hasRangeArgs = effectiveRepoList.some((repo) => repo.diffArgs.length > 0);
-  const sameAsBeforeNote = sameAsBefore ? "。前回と同じ差分です" + (hasRangeArgs ? "。範囲を指定しているときは修正をコミットしないと反映されません" : "") : "";
+  const sameAsBeforeNote = isSameAsBefore ? "。前回と同じ差分です" + (hasRangeArgs ? "。範囲を指定しているときは修正をコミットしないと反映されません" : "") : "";
   console.log("追従: 引き継ぎ " + idMap.size + "件, 消えた行 " + lostIds.length + "件, 増えた行 " + newIds.length + "件" + sameAsBeforeNote);
 }
 
@@ -406,17 +547,24 @@ function expandOwns(owns) {
   return ids;
 }
 
-// 各stepの owns と owns_files を整数IDの owns に展開する。owns には整数と範囲とF番号を混ぜてよい
+// owns や refs の値を整数IDの配列に展開する。整数と範囲とF番号を混ぜてよい
+function expandStepIds(rawValues, files) {
+  const values = rawValues || [];
+  const fileRefs = values.filter((value) => /^F\d+$/.test(String(value)));
+  const idValues = values.filter((value) => !/^F\d+$/.test(String(value)));
+  const fromFileRefs = expandOwnsFiles(fileRefs, files);
+  return { ids: [...expandOwns(idValues), ...fromFileRefs.ids], unknownFiles: fromFileRefs.unknownFiles };
+}
+
+// 各stepの owns と owns_files と refs を整数IDの配列に展開する
 function resolveSteps(files, steps) {
   const unknownFiles = [];
   const resolvedSteps = steps.map((step) => {
-    const rawOwns = step.owns || [];
-    const fileRefs = rawOwns.filter((value) => /^F\d+$/.test(String(value)));
-    const idOwns = rawOwns.filter((value) => !/^F\d+$/.test(String(value)));
-    const fromOwns = expandOwnsFiles(fileRefs, files);
+    const fromOwns = expandStepIds(step.owns, files);
     const fromOwnsFiles = expandOwnsFiles(step.owns_files || [], files);
-    unknownFiles.push(...fromOwns.unknownFiles, ...fromOwnsFiles.unknownFiles);
-    return Object.assign({}, step, { owns: [...expandOwns(idOwns), ...fromOwns.ids, ...fromOwnsFiles.ids] });
+    const fromRefs = expandStepIds(step.refs, files);
+    unknownFiles.push(...fromOwns.unknownFiles, ...fromOwnsFiles.unknownFiles, ...fromRefs.unknownFiles);
+    return Object.assign({}, step, { owns: [...fromOwns.ids, ...fromOwnsFiles.ids], refs: fromRefs.ids });
   });
   return { resolvedSteps, unknownFiles };
 }
@@ -460,7 +608,7 @@ function appendComment(targetDir, body) {
   const comments = readJson(commentsPath, []);
   const newComment = Object.assign({}, body, { replies: [], at: new Date().toISOString() });
   comments.push(newComment);
-  fs.writeFileSync(commentsPath, JSON.stringify(comments, null, 2));
+  writeFileAtomic(commentsPath, JSON.stringify(comments, null, 2));
   return { comment: newComment, commentNumber: comments.length };
 }
 // コメント番号(1始まり)の replies に AI の返信を追記する
@@ -471,59 +619,90 @@ function appendReply(targetDir, commentNumber, body) {
   if (!target) throw new Error("コメント番号が範囲外です: " + commentNumber);
   if (!Array.isArray(target.replies)) target.replies = [];
   target.replies.push({ author: "ai", body: body, at: new Date().toISOString() });
-  fs.writeFileSync(commentsPath, JSON.stringify(comments, null, 2));
+  writeFileAtomic(commentsPath, JSON.stringify(comments, null, 2));
   return target;
 }
 
-function buildFileDiffText(file) {
-  return file.lines
-    .filter((line) => line.kind === "add" || line.kind === "del")
-    .map((line) => (line.kind === "add" ? "+ " : "- ") + line.text)
-    .join("\n");
+function buildFileDiffText(file, ownedIds) {
+  const changedLines = file.lines.filter((line) => line.kind === "add" || line.kind === "del");
+  const targetLines = ownedIds ? changedLines.filter((line) => ownedIds.has(line.id)) : changedLines;
+  return targetLines.map((line) => (line.kind === "add" ? "+ " : "- ") + line.text).join("\n");
 }
 
-function buildAskPrompt(targetDir, comment) {
-  const changes = readJson(path.join(targetDir, "changes.json"), { files: [] });
+// change_idからコメント対象の行を全ファイル横断で探す。写せない古いコメントはファイルパスとrepoで代わりに絞り込む
+function findCommentTarget(files, comment) {
+  if (comment.change_id != null) {
+    for (const file of files) {
+      const line = file.lines.find((candidate) => candidate.id === comment.change_id);
+      if (line) return { file, line };
+    }
+  }
+  const matchedFiles = files.filter((file) => file.file === comment.file);
+  const file = comment.repo != null
+    ? matchedFiles.find((matchedFile) => matchedFile.repo === comment.repo) || null
+    : matchedFiles[0] || null;
+  return { file, line: null };
+}
+
+function buildAskPrompt(targetDir, comment, changes) {
+  const resolvedChanges = changes || readJson(path.join(targetDir, "changes.json"), { files: [] });
   const steps = readJson(path.join(targetDir, "steps.json"), { steps: [] });
-  const file = changes.files.find((file) => file.file === comment.file);
-  const diffText = file ? buildFileDiffText(file) : "";
-  const step = (steps.steps || []).find((step) => (step.order != null ? step.order : 0) === comment.step_order);
+  const target = findCommentTarget(resolvedChanges.files, comment);
+  const step = (steps.steps || []).find((candidate) => (candidate.order != null ? candidate.order : 0) === comment.step_order);
+  const resolvedStep = step ? resolveSteps(resolvedChanges.files, [step]).resolvedSteps[0] : null;
+  const ownedIds = resolvedStep ? new Set([...resolvedStep.owns, ...resolvedStep.refs]) : null;
+  if (ownedIds && target.line) ownedIds.add(target.line.id);
+  const diffText = target.file ? buildFileDiffText(target.file, ownedIds) : "";
   const narration = step ? step.narration : "";
-  return [
+  const repo = target.file ? target.file.repo : comment.repo;
+  const repoTag = repo && repo !== "." ? repo + " " : "";
+  const promptLines = [
     "以下のコード差分について、レビュアーからの質問に簡潔に答えてください",
     "",
-    "ファイル " + comment.file,
+    "ファイル " + repoTag + comment.file,
     "ストーリーの説明 " + narration,
-    "",
-    "該当の差分",
-    diffText,
-    "",
-    "質問 " + comment.body,
-  ].join("\n");
+  ];
+  if (target.line) {
+    promptLines.push("", "質問対象の行 " + (target.line.kind === "add" ? "+ " : "- ") + target.line.text);
+  }
+  promptLines.push("", "該当の差分", diffText, "", "質問 " + comment.body);
+  return promptLines.join("\n");
 }
 
-function askHaiku(sessionId, prompt, onDone) {
+function askHaiku(cwd, sessionId, prompt, onResult) {
   const claudeArgs = ["-p", "--resume", sessionId, "--model", "haiku", "--no-session-persistence", "--output-format", "json", prompt];
-  const child = spawn("claude", claudeArgs);
-  const chunks = [];
-  child.stdout.on("data", (chunk) => chunks.push(chunk));
+  const child = spawn("claude", claudeArgs, { cwd });
+  const stdoutChunks = [];
+  let isResultSent = false;
+  const sendResultOnce = (result) => {
+    if (isResultSent) return;
+    isResultSent = true;
+    onResult(result);
+  };
+  child.stdout.on("data", (chunk) => stdoutChunks.push(chunk));
+  child.stderr.resume();
   child.on("close", () => {
+    let parsed;
     try {
-      const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8"));
-      onDone(parsed.result || "");
+      parsed = JSON.parse(Buffer.concat(stdoutChunks).toString("utf8"));
     } catch (error) {
-      onDone("");
+      sendResultOnce("");
+      return;
     }
+    sendResultOnce(parsed.result || "");
   });
-  child.on("error", () => onDone(""));
+  child.on("error", () => sendResultOnce(""));
 }
 
-function replyWithHaiku(targetDir, sessionId, comment, commentNumber) {
-  const prompt = buildAskPrompt(targetDir, comment);
-  askHaiku(sessionId, prompt, (answer) => {
-    if (answer === "") return;
-    appendReply(targetDir, commentNumber, answer);
-  });
+// changes.json の cwd。無ければ現在の作業ディレクトリを使う
+function resolveCwd(changes) {
+  return (changes && changes.cwd) || process.cwd();
+}
+
+// haiku に渡す cwd とプロンプトを組み立てる。changes.json か steps.json が壊れていれば例外を投げる
+function buildHaikuRequest(targetDir, comment) {
+  const changes = readJson(path.join(targetDir, "changes.json"), { files: [] });
+  return { cwd: resolveCwd(changes), prompt: buildAskPrompt(targetDir, comment, changes) };
 }
 
 function readBody(request) {
@@ -555,7 +734,7 @@ function openBrowser(targetUrl) {
   child.unref();
 }
 
-function listenOnFreePort(server, startPort, bindHost, onReady) {
+function listenOnFreePort(server, startPort, bindHost, onResult) {
   let port = startPort;
   const tryListen = () => {
     server.once("error", (error) => {
@@ -566,7 +745,7 @@ function listenOnFreePort(server, startPort, bindHost, onReady) {
         throw error;
       }
     });
-    server.listen(port, bindHost, () => onReady(port));
+    server.listen(port, bindHost, () => onResult(port));
   };
   tryListen();
 }
@@ -576,11 +755,16 @@ function readServeInfo(targetDir) {
 }
 
 function writeServeInfo(targetDir, info) {
-  fs.writeFileSync(path.join(targetDir, "serve.json"), JSON.stringify(info, null, 2));
+  writeFileAtomic(path.join(targetDir, "serve.json"), JSON.stringify(info, null, 2));
+}
+
+// リクエスト処理中のエラーをserve.logに追記する。応答は変えない
+function appendServeLog(targetDir, message) {
+  fs.appendFileSync(path.join(targetDir, "serve.log"), message + "\n");
 }
 
 function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
-  let followRunning = false;
+  let isFollowRunning = false;
   const server = http.createServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/health") {
@@ -599,9 +783,22 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
       if (request.method === "POST" && request.url === "/comments") {
         const body = await readBody(request);
         const { comment, commentNumber } = appendComment(targetDir, body);
-        sendJson(response, 200, comment);
         const info = readServeInfo(targetDir);
-        if (info != null && info.sessionId != null) replyWithHaiku(targetDir, info.sessionId, comment, commentNumber);
+        let haikuRequest = null;
+        if (info != null && info.session_id != null) {
+          try {
+            haikuRequest = buildHaikuRequest(targetDir, comment);
+          } catch (error) {
+            appendServeLog(targetDir, "haiku返信の準備に失敗しました: " + String(error && error.message ? error.message : error));
+          }
+        }
+        sendJson(response, 200, comment);
+        if (haikuRequest != null) {
+          askHaiku(haikuRequest.cwd, info.session_id, haikuRequest.prompt, (answer) => {
+            if (answer === "") return;
+            appendReply(targetDir, commentNumber, answer);
+          });
+        }
         return;
       }
       if (request.method === "POST" && request.url === "/done") {
@@ -615,40 +812,56 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
         return;
       }
       if (request.method === "POST" && request.url === "/follow") {
-        if (followRunning) {
+        if (isFollowRunning) {
           sendJson(response, 409, { started: false, error: "差分の取り込みが実行中です" });
           return;
         }
-        let logFd = null;
+        let logFd;
         try {
           logFd = fs.openSync(path.join(targetDir, "serve.log"), "a");
-          const followCwd = readJson(path.join(targetDir, "changes.json"), {}).cwd || process.cwd();
-          const child = spawn(process.execPath, [__filename, "prep", path.resolve(targetDir)], { cwd: followCwd, stdio: ["ignore", logFd, logFd], detached: true });
-          followRunning = true;
-          let stopped = false;
-          const stopFollowing = () => {
-            if (stopped) return;
-            stopped = true;
-            followRunning = false;
-            fs.closeSync(logFd);
-          };
-          child.on("error", (error) => {
-            fs.writeSync(logFd, "prep起動失敗: " + String(error && error.message ? error.message : error) + "\n");
-            stopFollowing();
-          });
-          child.on("exit", stopFollowing);
-          child.unref();
         } catch (error) {
-          if (logFd != null) fs.closeSync(logFd);
-          throw error;
+          sendJson(response, 500, { error: String(error && error.message ? error.message : error) });
+          return;
         }
+        let cwd;
+        try {
+          cwd = resolveCwd(readJson(path.join(targetDir, "changes.json"), {}));
+        } catch (error) {
+          fs.closeSync(logFd);
+          sendJson(response, 500, { error: String(error && error.message ? error.message : error) });
+          return;
+        }
+        const child = spawn(process.execPath, [__filename, "prep", path.resolve(targetDir)], { cwd, stdio: ["ignore", logFd, logFd], detached: true });
+        isFollowRunning = true;
+        let stopped = false;
+        const stopFollowing = () => {
+          if (stopped) return;
+          stopped = true;
+          isFollowRunning = false;
+          fs.closeSync(logFd);
+        };
+        child.on("error", (error) => {
+          fs.writeSync(logFd, "prep起動失敗: " + String(error && error.message ? error.message : error) + "\n");
+          stopFollowing();
+        });
+        child.on("exit", (exitCode, signal) => {
+          if (signal != null) fs.writeSync(logFd, "prep異常終了: シグナル" + signal + "\n");
+          else if (exitCode !== 0) fs.writeSync(logFd, "prep異常終了: 終了コード" + exitCode + "\n");
+          stopFollowing();
+        });
+        child.unref();
         sendJson(response, 200, { started: true });
         return;
       }
       response.writeHead(404, { "Content-Type": "text/plain; charset=utf-8" });
       response.end("not found");
     } catch (error) {
-      sendJson(response, 500, { error: String(error && error.message ? error.message : error) });
+      const message = String(error && error.message ? error.message : error);
+      if (response.headersSent) {
+        appendServeLog(targetDir, "応答済みのリクエストでエラーが発生しました: " + message);
+        return;
+      }
+      sendJson(response, 500, { error: message });
     }
   });
 
@@ -656,7 +869,7 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
   const displayHost = bindHost === "0.0.0.0" ? os.hostname() : bindHost;
   listenOnFreePort(server, startPort, bindHost, (port) => {
     const url = "http://" + displayHost + ":" + port + "/";
-    writeServeInfo(targetDir, { pid: process.pid, port: port, host: bindHost, url: url, sessionId: sessionId, startedAt: new Date().toISOString() });
+    writeServeInfo(targetDir, { pid: process.pid, port, host: bindHost, url, session_id: sessionId, started_at: new Date().toISOString() });
     console.log("storiff serve: " + url);
     console.log("レビュー完了(done.flag)を待ちます。終了(close.flag)でサーバを閉じます");
   });
@@ -688,15 +901,21 @@ function isServeAlive(info, onResult) {
     onResult(false);
     return;
   }
+  let isResultSent = false;
+  const sendResultOnce = (isAlive) => {
+    if (isResultSent) return;
+    isResultSent = true;
+    onResult(isAlive);
+  };
   const requestHost = info.host === "0.0.0.0" ? "127.0.0.1" : info.host;
   const request = http.get({ host: requestHost, port: info.port, path: "/health", timeout: 1000 }, (response) => {
-    onResult(response.statusCode === 200);
+    sendResultOnce(response.statusCode === 200);
     response.resume();
   });
-  request.on("error", () => onResult(false));
+  request.on("error", () => sendResultOnce(false));
   request.on("timeout", () => {
     request.destroy();
-    onResult(false);
+    sendResultOnce(false);
   });
 }
 
@@ -782,7 +1001,7 @@ function indexComments(){
   commentsByKey={};
   lostCommentsByStep={};
   var stepOrders=(story.steps||[]).map(function(step, index){return stepNumber(step, index);});
-  var lastStepOrder=stepOrders.length?stepOrders[stepOrders.length-1]:null;
+  var lastStepOrder=stepOrders.length>0?stepOrders[stepOrders.length-1]:null;
   (story.comments||[]).forEach(function(comment){
     if(comment.change_id==null){
       var stepOrder=comment.step_order;
@@ -820,9 +1039,9 @@ function renderBanner(){
   var validation=story.validation||{ok:true};
   if(validation.ok) return;
   var parts=['ストーリーが全変更を過不足なく説明できていません'];
-  if(validation.missing&&validation.missing.length) parts.push('説明もれの変更ID '+validation.missing.join(', '));
-  if(validation.duplicated&&validation.duplicated.length) parts.push('重複所有の変更ID '+validation.duplicated.join(', '));
-  if(validation.unknown_files&&validation.unknown_files.length) parts.push('不明なファイル '+validation.unknown_files.join(', '));
+  if(validation.missing&&validation.missing.length>0) parts.push('説明もれの変更ID '+validation.missing.join(', '));
+  if(validation.duplicated&&validation.duplicated.length>0) parts.push('重複所有の変更ID '+validation.duplicated.join(', '));
+  if(validation.unknown_files&&validation.unknown_files.length>0) parts.push('不明なファイル '+validation.unknown_files.join(', '));
   var box=document.createElement('div');
   box.className='banner';
   box.textContent=parts.join(' / ');
@@ -858,7 +1077,7 @@ function renderComment(comment){
   });
   return box;
 }
-function openForm(row, line, file, stepOrder){
+function openForm(row, line, file, stepOrder, repo){
   if(row.nextSibling&&row.nextSibling.className==='comment-form') return;
   var openedMinimapSignature=minimapSignature;
   var form=document.createElement('div');
@@ -877,7 +1096,7 @@ function openForm(row, line, file, stepOrder){
       msg.style.display='block';
       return;
     }
-    var payload={change_id:line.id, file:file, line:(line.new==null?line.old:line.new), step_order:stepOrder, body:body};
+    var payload={change_id:line.id, file:file, repo:repo, line:(line.new==null?line.old:line.new), step_order:stepOrder, body:body};
     fetch('/comments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
       .then(function(res){return res.json();})
       .then(function(saved){
@@ -937,7 +1156,7 @@ function appendLine(parent, line, file, stepOrder, ownsSet, refsSet){
   var row=buildCell(line, ownsSet, refsSet, file);
   if(line.id!=null){
     row.className+=' clickable';
-    row.onclick=function(){openForm(row, line, file.file, stepOrder);};
+    row.onclick=function(){openForm(row, line, file.file, stepOrder, file.repo);};
   }
   parent.appendChild(row);
   appendExistingComments(parent, line, file);
@@ -950,7 +1169,7 @@ function appendSplitRow(parent, splitLine, file, stepOrder, ownsSet, refsSet){
     var cell=buildCell(line, ownsSet, refsSet, file);
     if(line&&line.id!=null){
       cell.className+=' clickable';
-      cell.onclick=function(){openForm(rowElement, line, file.file, stepOrder);};
+      cell.onclick=function(){openForm(rowElement, line, file.file, stepOrder, file.repo);};
     }
     rowElement.appendChild(cell);
   });
@@ -1250,7 +1469,7 @@ function render(){
     diff.appendChild(renderFile(file, step, ownsSet, refsSet));
   });
   var lostComments=lostCommentsByStep[stepNumber(step, stepIndex)]||[];
-  if(lostComments.length){
+  if(lostComments.length>0){
     var lostBox=document.createElement('div');
     lostBox.className='file';
     var lostHeading=document.createElement('div');
@@ -1688,6 +1907,7 @@ function main() {
         globalDiffArgs.push(rest[index]);
       }
     }
+    const hasExplicitArgs = rest.length > 0;
     if (repoList.length === 0) {
       repoList.push({ path: ".", diffArgs: globalDiffArgs });
     } else {
@@ -1695,7 +1915,12 @@ function main() {
         if (repo.diffArgs.length === 0) repo.diffArgs = globalDiffArgs;
       }
     }
-    runPrep(targetDir, repoList);
+    try {
+      runPrep(targetDir, repoList, hasExplicitArgs);
+    } catch (error) {
+      console.log("追従しません: steps.json か comments.json が壊れています(" + String(error.message).split("\n")[0].trim() + ")");
+      process.exit(1);
+    }
     return;
   }
   if (command === "serve") {
@@ -1722,6 +1947,10 @@ function main() {
     const existing = readServeInfo(targetDir);
     isServeAlive(existing, (alive) => {
       if (alive) {
+        if (sessionId != null && sessionId !== existing.session_id) {
+          writeServeInfo(targetDir, Object.assign({}, existing, { session_id: sessionId }));
+          console.log("session-id を更新しました: " + sessionId);
+        }
         console.log("storiff serve: " + existing.url);
         console.log("すでに起動しているビューアに接続しました");
         openBrowser(existing.url);
@@ -1746,3 +1975,5 @@ module.exports.foldIdsToRanges = foldIdsToRanges;
 module.exports.remapSteps = remapSteps;
 module.exports.remapComments = remapComments;
 module.exports.runPrep = runPrep;
+module.exports.resolveSteps = resolveSteps;
+module.exports.buildValidation = buildValidation;
