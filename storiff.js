@@ -11,6 +11,9 @@ const CHANGED_LINES_PER_STEP_GUIDE = 80;
 // 前回と今回のどちらかで同じ内容の行がこの本数を超えたら、単調増加列の候補から外し出現順に対応させる
 const SAME_CONTENT_LINE_COUNT_MAX = 100;
 
+// 単調増加列を計算する候補の総数がこれを超えたら、計算をやめて出現順に対応させる
+const MONOTONIC_CANDIDATE_COUNT_MAX = 5000000;
+
 // serve のデーモン起動を待つときのポーリング間隔と上限
 const SERVE_POLL_INTERVAL_MSEC = 200;
 const SERVE_START_TIMEOUT_MSEC = 10000;
@@ -24,6 +27,15 @@ function writeFileAtomic(filePath, content) {
   const tempPath = filePath + ".tmp" + process.pid + "-" + Date.now();
   fs.writeFileSync(tempPath, content);
   fs.renameSync(tempPath, filePath);
+}
+
+// writeFileAtomic が強制終了で残した一時ファイルを消す
+function cleanupStaleTempFiles(targetDir) {
+  if (!fs.existsSync(targetDir)) return;
+  const tempFileNamePattern = /\.tmp\d+-\d+$/;
+  for (const entry of fs.readdirSync(targetDir)) {
+    if (tempFileNamePattern.test(entry)) fs.unlinkSync(path.join(targetDir, entry));
+  }
 }
 
 // ~/.storiff/config.json の既定値。CLI引数の方が優先される
@@ -178,12 +190,22 @@ function computeChainLengths(values) {
   return lengths;
 }
 
+// previousIdの昇順に並べたcurrentIdsのうち先頭からpreviousIdsと同じ数だけを出現順に対応させる
+function assignByAppearanceOrder(idMap, previousIds, currentIds) {
+  const sortedPreviousIds = [...previousIds].sort((left, right) => left - right);
+  const pairCount = Math.min(sortedPreviousIds.length, currentIds.length);
+  for (let index = 0; index < pairCount; index++) {
+    idMap.set(sortedPreviousIds[index], currentIds[index]);
+  }
+}
+
 // previousIdの昇順とcurrentIdの昇順が両方保たれる対応の中で、最も多く引き継げる組み合わせを選ぶ
 // 各候補について前から見た単調増加列の長さと後ろから見た単調増加列の長さを求め、
 // 両方を足した長さが全体の最大値と一致する候補だけを、previousId昇順・currentId昇順に選んでいく
 // 同じキーの候補が複数あっても、選べるcurrentIdのうち最も早いものが優先されるので前後関係が入れ替わらない
 // 同じ内容の行がSAME_CONTENT_LINE_COUNT_MAXを超えて並ぶキーは候補数が本数の掛け算で膨れ上がるため、
 // そのキーだけこの計算から外し、前回と今回の出現順どうしをそのまま対応させる
+// 候補の総数がMONOTONIC_CANDIDATE_COUNT_MAXを超えたときも、同じく出現順どうしの対応に落とす
 function pickMonotonicIdMap(candidateGroups) {
   const previousIdsByCurrentIds = new Map();
   for (const group of candidateGroups) {
@@ -194,59 +216,61 @@ function pickMonotonicIdMap(candidateGroups) {
   const idMap = new Map();
   const monotonicGroups = [];
   const resolvedCurrentIds = new Set();
+  let monotonicCandidateCount = 0;
   for (const group of candidateGroups) {
     const previousIds = previousIdsByCurrentIds.get(group.currentIds);
     const isFrequentContent = previousIds.length > SAME_CONTENT_LINE_COUNT_MAX || group.currentIds.length > SAME_CONTENT_LINE_COUNT_MAX;
     if (!isFrequentContent) {
       monotonicGroups.push(group);
+      monotonicCandidateCount += group.currentIds.length;
       continue;
     }
     if (resolvedCurrentIds.has(group.currentIds)) continue;
     resolvedCurrentIds.add(group.currentIds);
-    const sortedPreviousIds = [...previousIds].sort((left, right) => left - right);
-    const sortedCurrentIds = group.currentIds;
-    const pairCount = Math.min(sortedPreviousIds.length, sortedCurrentIds.length);
-    for (let index = 0; index < pairCount; index++) {
-      idMap.set(sortedPreviousIds[index], sortedCurrentIds[index]);
-    }
+    assignByAppearanceOrder(idMap, previousIds, group.currentIds);
   }
 
-  const forwardCandidates = [];
+  if (monotonicCandidateCount > MONOTONIC_CANDIDATE_COUNT_MAX) {
+    const resolvedByAppearanceOrder = new Set();
+    for (const group of monotonicGroups) {
+      if (resolvedByAppearanceOrder.has(group.currentIds)) continue;
+      resolvedByAppearanceOrder.add(group.currentIds);
+      assignByAppearanceOrder(idMap, previousIdsByCurrentIds.get(group.currentIds), group.currentIds);
+    }
+    return idMap;
+  }
+
+  const candidates = [];
+  const groupOffsets = [];
   for (const group of monotonicGroups) {
+    groupOffsets.push(candidates.length);
     for (const currentId of [...group.currentIds].reverse()) {
-      forwardCandidates.push({ previousId: group.previousId, currentId });
+      candidates.push({ previousId: group.previousId, currentId });
     }
   }
-  const forwardLengths = computeChainLengths(forwardCandidates.map((candidate) => candidate.currentId));
+  const currentIdSequence = candidates.map((candidate) => candidate.currentId);
+  const forwardLengths = computeChainLengths(currentIdSequence);
 
-  const backwardCandidates = [];
-  for (const group of [...monotonicGroups].reverse()) {
-    for (const currentId of group.currentIds) {
-      backwardCandidates.push({ previousId: group.previousId, currentId });
-    }
+  const reversedNegatedSequence = [...currentIdSequence].reverse().map((currentId) => -currentId);
+  const backwardLengthsReversed = computeChainLengths(reversedNegatedSequence);
+  const candidateCount = candidates.length;
+  const backwardLengths = new Array(candidateCount);
+  for (let index = 0; index < candidateCount; index++) {
+    backwardLengths[index] = backwardLengthsReversed[candidateCount - 1 - index];
   }
-  const backwardLengths = computeChainLengths(backwardCandidates.map((candidate) => -candidate.currentId));
-
-  const backwardLengthMap = new Map();
-  backwardCandidates.forEach((candidate, index) => {
-    backwardLengthMap.set(candidate.previousId + "," + candidate.currentId, backwardLengths[index]);
-  });
-  const combinedLengthMap = new Map();
-  forwardCandidates.forEach((candidate, index) => {
-    const key = candidate.previousId + "," + candidate.currentId;
-    combinedLengthMap.set(key, forwardLengths[index] + backwardLengthMap.get(key) - 1);
-  });
 
   const maxLength = forwardLengths.reduce((largest, length) => Math.max(largest, length), 0);
   let remaining = maxLength;
   let lastCurrentId = -Infinity;
-  for (const group of monotonicGroups) {
+  for (const [groupIndex, group] of monotonicGroups.entries()) {
     if (remaining === 0) break;
-    for (const currentId of group.currentIds) {
+    const groupOffset = groupOffsets[groupIndex];
+    const groupSize = group.currentIds.length;
+    for (const [indexInGroup, currentId] of group.currentIds.entries()) {
       if (currentId <= lastCurrentId) continue;
-      const key = group.previousId + "," + currentId;
-      if (combinedLengthMap.get(key) !== maxLength) continue;
-      if (backwardLengthMap.get(key) !== remaining) continue;
+      const candidateIndex = groupOffset + (groupSize - 1 - indexInGroup);
+      if (forwardLengths[candidateIndex] + backwardLengths[candidateIndex] - 1 !== maxLength) continue;
+      if (backwardLengths[candidateIndex] !== remaining) continue;
       idMap.set(group.previousId, currentId);
       lastCurrentId = currentId;
       remaining -= 1;
@@ -352,6 +376,7 @@ function matchesFilePattern(filePath, patterns) {
 }
 
 function runPrep(targetDir, repoList, hasExplicitArgs) {
+  cleanupStaleTempFiles(targetDir);
   const changesPath = path.join(targetDir, "changes.json");
   let previousChanges = null;
   if (fs.existsSync(changesPath)) {
