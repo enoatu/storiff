@@ -983,6 +983,8 @@ var viewMode='split';
 var CONTEXT_LINES=3;
 // 差分を取り込むボタンを再度押せるようにするまでの待ち時間
 var FOLLOW_COOLDOWN_MSEC=5000;
+// 単語単位で色を分けてよいと判断する、共通するトークンの最低の割合
+var WORD_DIFF_SIMILARITY_MIN=0.75;
 
 function esc(text){var div=document.createElement('div');div.textContent=text==null?'':String(text);return div.innerHTML;}
 // 先にHTMLエスケープしてから \`code\` と **強調** を効かせる
@@ -1149,8 +1151,159 @@ function highlightText(text, language){
   try{return hljs.highlight(String(text==null?'':text), {language:language, ignoreIllegal:true}).value;}
   catch(error){return esc(text);}
 }
+// 英数字とアンダースコアの連続を1トークン、それ以外は1文字ずつ1トークンにする
+function tokenizeLine(text){
+  var tokens=[];
+  var wordCharRegexp=/[A-Za-z0-9_]/;
+  var index=0;
+  while(index<text.length){
+    var startIndex=index;
+    if(wordCharRegexp.test(text[index])){
+      while(index<text.length&&wordCharRegexp.test(text[index])) index++;
+    }else{
+      index++;
+    }
+    tokens.push({text:text.slice(startIndex, index), start:startIndex, end:index});
+  }
+  return tokens;
+}
+// 左右のトークン列から最長共通部分列の長さの表を作る
+function buildTokenLcsTable(leftTokens, rightTokens){
+  var table=[];
+  for(var row=0; row<=leftTokens.length; row++){
+    table.push(new Array(rightTokens.length+1).fill(0));
+  }
+  for(var row=1; row<=leftTokens.length; row++){
+    for(var column=1; column<=rightTokens.length; column++){
+      if(leftTokens[row-1].text===rightTokens[column-1].text){
+        table[row][column]=table[row-1][column-1]+1;
+      }else{
+        table[row][column]=Math.max(table[row-1][column], table[row][column-1]);
+      }
+    }
+  }
+  return table;
+}
+// 一致しなかったトークンをまとめ、開始位置と終了位置の組にする
+function buildRangesFromUnmatchedTokens(tokens, matchedFlags){
+  var ranges=[];
+  var rangeStart=null;
+  for(var index=0; index<tokens.length; index++){
+    if(!matchedFlags[index]){
+      if(rangeStart===null) rangeStart=tokens[index].start;
+    }else if(rangeStart!==null){
+      ranges.push([rangeStart, tokens[index-1].end]);
+      rangeStart=null;
+    }
+  }
+  if(rangeStart!==null) ranges.push([rangeStart, tokens[tokens.length-1].end]);
+  return ranges;
+}
+// 左右の文字列を単語単位で比べ、変わった範囲と一致した割合を求める
+function computeChangedRanges(leftText, rightText){
+  var leftTokens=tokenizeLine(leftText);
+  var rightTokens=tokenizeLine(rightText);
+  var lcsTable=buildTokenLcsTable(leftTokens, rightTokens);
+  var leftMatched=new Array(leftTokens.length);
+  var rightMatched=new Array(rightTokens.length);
+  var row=leftTokens.length;
+  var column=rightTokens.length;
+  while(row>0&&column>0){
+    if(leftTokens[row-1].text===rightTokens[column-1].text){
+      leftMatched[row-1]=true;
+      rightMatched[column-1]=true;
+      row--;
+      column--;
+    }else if(lcsTable[row-1][column]>=lcsTable[row][column-1]){
+      row--;
+    }else{
+      column--;
+    }
+  }
+  var matchedTokenCount=lcsTable[leftTokens.length][rightTokens.length];
+  var tokenCountMin=Math.min(leftTokens.length, rightTokens.length);
+  return {
+    leftRanges:buildRangesFromUnmatchedTokens(leftTokens, leftMatched),
+    rightRanges:buildRangesFromUnmatchedTokens(rightTokens, rightMatched),
+    similarityRatio:tokenCountMin>0?matchedTokenCount/tokenCountMin:1,
+  };
+}
+// del側とadd側の文字列を比べ、似ていなければ色分けの対象外(null)にする
+function computeWordDiffForPair(delText, addText){
+  if(delText==null||addText==null) return null;
+  var changedRanges=computeChangedRanges(delText, addText);
+  if(changedRanges.similarityRatio<WORD_DIFF_SIMILARITY_MIN) return null;
+  return changedRanges;
+}
+// テキストノードを文字位置で辿り、変わった範囲だけをspanで包む
+function wrapWordDiffRanges(container, ranges){
+  var offset=0;
+  var rangeIndex=0;
+  function wrapTextNode(textNode){
+    var text=textNode.textContent;
+    var nodeStart=offset;
+    var nodeEnd=offset+text.length;
+    offset=nodeEnd;
+    var segments=[];
+    var cursor=nodeStart;
+    var hasChanged=false;
+    while(cursor<nodeEnd){
+      while(rangeIndex<ranges.length&&ranges[rangeIndex][1]<=cursor) rangeIndex++;
+      if(rangeIndex>=ranges.length||ranges[rangeIndex][0]>=nodeEnd){
+        segments.push({text:text.slice(cursor-nodeStart), changed:false});
+        cursor=nodeEnd;
+        break;
+      }
+      var rangeStart=ranges[rangeIndex][0];
+      var rangeEnd=ranges[rangeIndex][1];
+      if(rangeStart>cursor){
+        segments.push({text:text.slice(cursor-nodeStart, rangeStart-nodeStart), changed:false});
+        cursor=rangeStart;
+        continue;
+      }
+      var segmentEnd=Math.min(rangeEnd, nodeEnd);
+      segments.push({text:text.slice(cursor-nodeStart, segmentEnd-nodeStart), changed:true});
+      hasChanged=true;
+      cursor=segmentEnd;
+      if(segmentEnd>=rangeEnd) rangeIndex++;
+    }
+    if(!hasChanged) return;
+    var fragment=document.createDocumentFragment();
+    segments.forEach(function(segment){
+      if(segment.text==='') return;
+      if(segment.changed){
+        var wordSpan=document.createElement('span');
+        wordSpan.className='word-diff';
+        wordSpan.textContent=segment.text;
+        fragment.appendChild(wordSpan);
+      }else{
+        fragment.appendChild(document.createTextNode(segment.text));
+      }
+    });
+    textNode.parentNode.replaceChild(fragment, textNode);
+  }
+  function walkNode(node){
+    if(node.nodeType===Node.TEXT_NODE){wrapTextNode(node); return;}
+    if(node.nodeType===Node.ELEMENT_NODE){
+      Array.prototype.slice.call(node.childNodes).forEach(function(childNode){walkNode(childNode);});
+    }
+  }
+  walkNode(container);
+}
+// del行とadd行の組を比べ、変わった単語だけに色を足す
+function applyWordDiffHighlight(textLabel, line, counterpartLine){
+  if(line.kind!=='add'&&line.kind!=='del') return;
+  if(!counterpartLine) return;
+  var delText=line.kind==='del'?line.text:counterpartLine.text;
+  var addText=line.kind==='add'?line.text:counterpartLine.text;
+  var wordDiff=computeWordDiffForPair(delText, addText);
+  if(!wordDiff) return;
+  var changedRanges=line.kind==='del'?wordDiff.leftRanges:wordDiff.rightRanges;
+  if(changedRanges.length===0) return;
+  wrapWordDiffRanges(textLabel, changedRanges);
+}
 // 差分1行のマス目を作る。lineがnullなら片側だけの空マス
-function buildCell(line, ownsSet, refsSet, file){
+function buildCell(line, ownsSet, refsSet, file, counterpartLine){
   var cell=document.createElement('div');
   if(!line){cell.className='line empty'; return cell;}
   cell.className='line '+lineClass(line, ownsSet, refsSet);
@@ -1165,6 +1318,7 @@ function buildCell(line, ownsSet, refsSet, file){
   var textLabel=document.createElement('span');
   textLabel.className='txt';
   textLabel.innerHTML=highlightText(line.text, languageOf(file.file));
+  applyWordDiffHighlight(textLabel, line, counterpartLine);
   cell.appendChild(numberLabel);
   cell.appendChild(markerLabel);
   cell.appendChild(textLabel);
@@ -1177,8 +1331,8 @@ function appendExistingComments(parent, line, file){
   existing.forEach(function(comment){parent.appendChild(renderComment(comment));});
 }
 // 統合表示の1行を追加する。クリックでコメント欄を開く
-function appendLine(parent, line, file, stepOrder, ownsSet, refsSet){
-  var row=buildCell(line, ownsSet, refsSet, file);
+function appendLine(parent, line, file, stepOrder, ownsSet, refsSet, counterpartLine){
+  var row=buildCell(line, ownsSet, refsSet, file, counterpartLine);
   if(line.id!=null){
     row.className+=' clickable';
     row.onclick=function(){openForm(row, line, file.file, stepOrder, file.repo);};
@@ -1190,11 +1344,12 @@ function appendLine(parent, line, file, stepOrder, ownsSet, refsSet){
 function appendSplitRow(parent, splitLine, file, stepOrder, ownsSet, refsSet){
   var rowElement=document.createElement('div');
   rowElement.className='split-row';
-  [splitLine.left, splitLine.right].forEach(function(line){
-    var cell=buildCell(line, ownsSet, refsSet, file);
-    if(line&&line.id!=null){
+  var sides=[{line:splitLine.left, counterpartLine:splitLine.right}, {line:splitLine.right, counterpartLine:splitLine.left}];
+  sides.forEach(function(side){
+    var cell=buildCell(side.line, ownsSet, refsSet, file, side.counterpartLine);
+    if(side.line&&side.line.id!=null){
       cell.className+=' clickable';
-      cell.onclick=function(){openForm(rowElement, line, file.file, stepOrder, file.repo);};
+      cell.onclick=function(){openForm(rowElement, side.line, file.file, stepOrder, file.repo);};
     }
     rowElement.appendChild(cell);
   });
@@ -1215,31 +1370,49 @@ function appendFold(parent, hiddenCount, appendHidden){
   };
   parent.appendChild(foldRow);
 }
-// del行とadd行を突き合わせ、左右並列の行の並びを作る
-function buildSplitLines(lines, visible){
-  var splitLines=[];
-  var delLines=[];
-  var addLines=[];
-  function flush(){
-    var pairCount=Math.max(delLines.length, addLines.length);
+// del行とadd行を突き合わせ、左右の組の並びを作る。context行は左右とも同じ行になる
+function buildLinePairs(lines){
+  var linePairs=[];
+  var pendingDelLines=[];
+  var pendingAddLines=[];
+  function flushPending(){
+    var pairCount=Math.max(pendingDelLines.length, pendingAddLines.length);
     for(var pairIndex=0; pairIndex<pairCount; pairIndex++){
-      var leftItem=delLines[pairIndex]||null;
-      var rightItem=addLines[pairIndex]||null;
-      var shown=(leftItem&&leftItem.visible)||(rightItem&&rightItem.visible);
-      splitLines.push({left:leftItem?leftItem.line:null, right:rightItem?rightItem.line:null, visible:!!shown});
+      linePairs.push({left:pendingDelLines[pairIndex]||null, right:pendingAddLines[pairIndex]||null});
     }
-    delLines=[];
-    addLines=[];
+    pendingDelLines=[];
+    pendingAddLines=[];
   }
-  for(var index=0; index<lines.length; index++){
-    var line=lines[index];
-    if(line.kind==='del'){delLines.push({line:line, visible:visible[index]}); continue;}
-    if(line.kind==='add'){addLines.push({line:line, visible:visible[index]}); continue;}
-    flush();
-    splitLines.push({left:line, right:line, visible:!!visible[index]});
-  }
-  flush();
+  lines.forEach(function(line){
+    if(line.kind==='del'){pendingDelLines.push(line); return;}
+    if(line.kind==='add'){pendingAddLines.push(line); return;}
+    flushPending();
+    linePairs.push({left:line, right:line});
+  });
+  flushPending();
+  return linePairs;
+}
+// 左右の組に、表示するかどうかの印を足す
+function buildSplitLines(lines, visible){
+  var visibleByLine=new Map();
+  lines.forEach(function(line, index){visibleByLine.set(line, !!visible[index]);});
+  var splitLines=[];
+  buildLinePairs(lines).forEach(function(linePair){
+    var shown=(linePair.left&&visibleByLine.get(linePair.left))||(linePair.right&&visibleByLine.get(linePair.right));
+    splitLines.push({left:linePair.left, right:linePair.right, visible:!!shown});
+  });
   return splitLines;
+}
+// del行とadd行の組を、行オブジェクトどうしの対応表にする
+function buildCounterpartMap(lines){
+  var counterpartByLine=new Map();
+  buildLinePairs(lines).forEach(function(linePair){
+    if(linePair.left&&linePair.right){
+      counterpartByLine.set(linePair.left, linePair.right);
+      counterpartByLine.set(linePair.right, linePair.left);
+    }
+  });
+  return counterpartByLine;
 }
 // owns行とrefs行の周囲だけを表示対象にする
 function computeVisible(lines, ownsSet, refsSet){
@@ -1326,6 +1499,7 @@ function renderFile(file, step, ownsSet, refsSet){
   return card;
 }
 function renderUnifiedCode(code, file, stepOrder, ownsSet, refsSet, visible){
+  var counterpartByLine=buildCounterpartMap(file.lines);
   var index=0;
   while(index<file.lines.length){
     if(!visible[index]){
@@ -1334,12 +1508,12 @@ function renderUnifiedCode(code, file, stepOrder, ownsSet, refsSet, visible){
       (function(fromIndex, toIndex){
         appendFold(code, toIndex-fromIndex+1, function(fragment){
           for(var hidden=fromIndex; hidden<=toIndex; hidden++){
-            appendLine(fragment, file.lines[hidden], file, stepOrder, ownsSet, refsSet);
+            appendLine(fragment, file.lines[hidden], file, stepOrder, ownsSet, refsSet, counterpartByLine.get(file.lines[hidden]));
           }
         });
       })(start, index-1);
     }else{
-      appendLine(code, file.lines[index], file, stepOrder, ownsSet, refsSet);
+      appendLine(code, file.lines[index], file, stepOrder, ownsSet, refsSet, counterpartByLine.get(file.lines[index]));
       index++;
     }
   }
@@ -1740,8 +1914,10 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 .line.clickable:hover{background:var(--accent-soft)}
 .add{background:#e6ffec}
 .add .mark{color:#1a7f37}
+.add .txt .word-diff{background:#8ae2a0}
 .del{background:#ffebe9}
 .del .mark{color:#cf222e}
+.del .txt .word-diff{background:#ffb3ab}
 .own{background:inherit}
 .add.own{background:#acf2bd}
 .del.own{background:#ffc9c2}
@@ -1783,8 +1959,10 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
   .file-note{background:#0f141b}
   .add{background:#12261a}
   .add .mark{color:#3fb950}
+  .add .txt .word-diff{background:#1f6b3f}
   .del{background:#291416}
   .del .mark{color:#f85149}
+  .del .txt .word-diff{background:#7d2d33}
   .add.own{background:#1c3b28}
   .del.own{background:#3d1d1f}
   .mm-mark{background:#39424d}

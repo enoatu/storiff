@@ -28,3 +28,6 @@ https://github.com/tomasz-tomczyk/crit をベースに、差分をストーリ�
   - 右側ミニマップ(いま全体のどこを見ているか)は全ファイルを固定順で並べて表示する
   - story ごとにファイル順を変える機能があると、ミニマップのファイル配置が story ごとに一貫しなくなる懸念
   - ミニマップは差分の自然順(prep が出す順)で固定し、owns_files の順序制御は廃止する案を検討中。未決
+
+# メモ
+- push 前に .claude-plugin/plugin.json:4 の "version" を上げる
