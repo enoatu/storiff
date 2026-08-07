@@ -8,6 +8,9 @@ const os = require("os");
 // 1stepがおおよそ1時間の作業に収まる目安の変更行数。これを超えるstepは分割の候補
 const CHANGED_LINES_PER_STEP_GUIDE = 80;
 
+// 理解度クイズの選択肢の最小数。これより少ないと当てずっぽうでも通ってしまう
+const QUIZ_CHOICE_COUNT_MIN = 3;
+
 // 前回と今回のどちらかで同じ内容の行がこの本数を超えたら、単調増加列の候補から外し出現順に対応させる
 const SAME_CONTENT_LINE_COUNT_MAX = 100;
 
@@ -503,6 +506,7 @@ function runPrep(targetDir, repoList, hasExplicitArgs) {
   writeFileAtomic(textOutputPath, changesText);
   writeFileAtomic(filesMapPath, filesMapText);
   console.log("生成: " + outputPath + " と " + textOutputPath + " と " + filesMapPath + " (変更ID " + changeIds.length + "件, ファイル " + files.length + "件, リポジトリ " + repos.length + "件" + excludedNote + ")");
+  if (config.quiz) console.log("理解度クイズ: 有効。各ステップに quiz を1問つける");
   if (!isFollow) return;
   if (!isSameAsBefore) {
     writeFileAtomic(path.join(targetDir, "steps.json"), JSON.stringify(Object.assign({}, previousSteps, { steps: remappedSteps }), null, 2));
@@ -610,6 +614,26 @@ function buildValidation(changeIds, files, steps) {
   }
   const ok = missing.length === 0 && duplicated.length === 0 && resolved.unknownFiles.length === 0;
   return { ok, missing, duplicated, unknown_files: resolved.unknownFiles, resolvedSteps: resolved.resolvedSteps };
+}
+
+// 理解度クイズの作りを確かめる。quiz を持たないstepは対象外
+function buildQuizIssues(steps) {
+  const issues = [];
+  steps.forEach((step, index) => {
+    const quiz = step.quiz;
+    if (quiz == null) return;
+    const choices = Array.isArray(quiz.choices) ? quiz.choices : [];
+    const uniqueChoices = new Set(choices.map((choice) => String(choice).trim()));
+    const reasons = [];
+    if (!quiz.question) reasons.push("question が空です");
+    if (choices.length < QUIZ_CHOICE_COUNT_MIN) reasons.push("choices が " + QUIZ_CHOICE_COUNT_MIN + "つに足りません");
+    if (uniqueChoices.size !== choices.length) reasons.push("choices に同じ選択肢があります");
+    if (!Number.isInteger(quiz.answer) || quiz.answer < 1 || quiz.answer > choices.length) reasons.push("answer が選択肢の番号(1始まり)になっていません");
+    if (!quiz.explanation) reasons.push("explanation が空です");
+    if (reasons.length === 0) return;
+    issues.push({ order: step.order != null ? step.order : index + 1, title: step.title || "", reasons });
+  });
+  return issues;
 }
 
 function buildStory(targetDir) {
@@ -985,6 +1009,12 @@ var CONTEXT_LINES=3;
 var FOLLOW_COOLDOWN_MSEC=5000;
 // 単語単位で色を分けてよいと判断する、共通するトークンの最低の割合
 var WORD_DIFF_SIMILARITY_MIN=0.75;
+// 理解度クイズの選択肢の最小数。これに満たないクイズは壊れているとみなして関門にしない
+var QUIZ_CHOICE_COUNT_MIN=3;
+// この回数まちがえると、答えを見て先へ進むボタンを出す
+var QUIZ_WRONG_COUNT_TO_REVEAL=2;
+// ステップ番号ごとの理解度クイズの回答ぐあい。再描画しても消さない
+var quizStateByOrder={};
 
 function esc(text){var div=document.createElement('div');div.textContent=text==null?'':String(text);return div.innerHTML;}
 // 先にHTMLエスケープしてから \`code\` と **強調** を効かせる
@@ -1056,7 +1086,7 @@ function renderStepList(){
     titleLabel.textContent=step.title;
     item.appendChild(numberLabel);
     item.appendChild(titleLabel);
-    item.onclick=function(){stepIndex=index;render();window.scrollTo(0,0);};
+    item.onclick=function(){goToStep(index);};
     list.appendChild(item);
   });
 }
@@ -1646,6 +1676,127 @@ function minimapJump(clientY){
   }
 }
 
+// 選べる形になっているクイズだけを返す。壊れたクイズで先へ進めなくならないようにする
+function getValidQuiz(step){
+  var quiz=step&&step.quiz;
+  if(!quiz||!quiz.question||!quiz.explanation) return null;
+  var choices=quiz.choices||[];
+  if(choices.length<QUIZ_CHOICE_COUNT_MIN) return null;
+  if(!(quiz.answer>=1&&quiz.answer<=choices.length)) return null;
+  return quiz;
+}
+// そのステップの回答ぐあい。まだ無ければ作って返す
+function quizStateOf(stepOrder){
+  if(!quizStateByOrder[stepOrder]) quizStateByOrder[stepOrder]={pickedNumber:null, wrongCount:0, isPassed:false, isFirstTry:false, isRevealed:false};
+  return quizStateByOrder[stepOrder];
+}
+// クイズが無いステップと、正解したか答えを見たステップは通過ずみ
+function isStepPassed(step, index){
+  if(!getValidQuiz(step)) return true;
+  return quizStateOf(stepNumber(step, index)).isPassed;
+}
+function canGoNext(){
+  if(stepIndex>=story.steps.length-1) return false;
+  return isStepPassed(story.steps[stepIndex], stepIndex);
+}
+function goToStep(nextIndex){stepIndex=nextIndex;render();window.scrollTo(0,0);}
+// 選んだ番号を採点する。正解したステップは選び直せない
+function answerQuiz(stepOrder, quiz, pickedNumber){
+  var state=quizStateOf(stepOrder);
+  if(state.isPassed) return;
+  state.pickedNumber=pickedNumber;
+  if(pickedNumber===quiz.answer){
+    state.isPassed=true;
+    state.isFirstTry=state.wrongCount===0;
+  }else{
+    state.wrongCount++;
+  }
+  render();
+}
+function renderQuizResult(state, quiz){
+  var resultBox=document.createElement('div');
+  if(state.isPassed){
+    resultBox.className='quiz-result';
+    var resultHead=document.createElement('div');
+    resultHead.className='quiz-result-head';
+    resultHead.textContent=state.isRevealed?('答えは '+quiz.answer+' 番です'):(state.isFirstTry?'一発で正解しました':'正解しました');
+    var explanationBox=document.createElement('div');
+    renderMarkdown(explanationBox, quiz.explanation);
+    resultBox.appendChild(resultHead);
+    resultBox.appendChild(explanationBox);
+    return resultBox;
+  }
+  if(state.wrongCount>0){
+    resultBox.className='quiz-result miss';
+    resultBox.textContent='ちがいます。差分と説明をもう一度読んでから選び直してください';
+    return resultBox;
+  }
+  resultBox.className='quiz-result hint';
+  resultBox.textContent='差分を読んで答えると、次のステップへ進めます';
+  return resultBox;
+}
+function renderQuiz(stepOrder, quiz){
+  var state=quizStateOf(stepOrder);
+  var card=document.createElement('div');
+  card.className='file';
+  var heading=document.createElement('div');
+  heading.className='file-head quiz-heading';
+  heading.textContent='理解度クイズ';
+  card.appendChild(heading);
+  var questionBox=document.createElement('div');
+  questionBox.className='quiz-question';
+  renderMarkdown(questionBox, quiz.question);
+  card.appendChild(questionBox);
+  var choiceList=document.createElement('div');
+  choiceList.className='quiz-choices';
+  quiz.choices.forEach(function(choice, choiceIndex){
+    var choiceNumber=choiceIndex+1;
+    var choiceButton=document.createElement('button');
+    choiceButton.className='quiz-choice';
+    if(state.isPassed&&choiceNumber===quiz.answer) choiceButton.className+=' correct';
+    if(state.pickedNumber===choiceNumber&&choiceNumber!==quiz.answer) choiceButton.className+=' wrong';
+    choiceButton.textContent=choiceNumber+'. '+choice;
+    choiceButton.disabled=state.isPassed;
+    choiceButton.onclick=function(){answerQuiz(stepOrder, quiz, choiceNumber);};
+    choiceList.appendChild(choiceButton);
+  });
+  card.appendChild(choiceList);
+  card.appendChild(renderQuizResult(state, quiz));
+  var actionRow=document.createElement('div');
+  actionRow.className='quiz-actions';
+  var readAgainButton=document.createElement('button');
+  readAgainButton.textContent='もう一度読む';
+  readAgainButton.onclick=function(){window.scrollTo(0,0);};
+  actionRow.appendChild(readAgainButton);
+  if(!state.isPassed&&state.wrongCount>=QUIZ_WRONG_COUNT_TO_REVEAL){
+    var revealButton=document.createElement('button');
+    revealButton.textContent='答えを見て進む';
+    revealButton.onclick=function(){
+      state.isPassed=true;
+      state.isRevealed=true;
+      render();
+    };
+    actionRow.appendChild(revealButton);
+  }
+  card.appendChild(actionRow);
+  return card;
+}
+// クイズのある全ステップを通過したときだけ、一発で正解した数を出す
+function renderQuizSummary(){
+  var quizCount=0, passedCount=0, firstTryCount=0;
+  story.steps.forEach(function(step, index){
+    if(!getValidQuiz(step)) return;
+    quizCount++;
+    var state=quizStateOf(stepNumber(step, index));
+    if(state.isPassed) passedCount++;
+    if(state.isFirstTry) firstTryCount++;
+  });
+  if(quizCount===0||passedCount<quizCount) return null;
+  var box=document.createElement('div');
+  box.className='quiz-summary';
+  box.textContent='理解度クイズ '+quizCount+'問中 '+firstTryCount+'問を一発で正解しました';
+  return box;
+}
 function render(){
   var step=story.steps[stepIndex];
   document.getElementById('storyTitle').textContent=story.title||'storiff';
@@ -1653,7 +1804,8 @@ function render(){
   renderMarkdown(document.getElementById('narration'), step?step.narration:'');
   document.getElementById('counter').textContent='Step '+(step?stepNumber(step, stepIndex):0)+' / '+story.steps.length;
   document.getElementById('prevBtn').disabled=stepIndex<=0;
-  document.getElementById('nextBtn').disabled=stepIndex>=story.steps.length-1;
+  document.getElementById('nextBtn').disabled=!canGoNext();
+  document.getElementById('quizNote').textContent=(step&&!isStepPassed(step, stepIndex))?'理解度クイズに答えると次へ進めます':'';
   renderStepList();
   renderBanner();
   var diff=document.getElementById('diff');
@@ -1678,11 +1830,17 @@ function render(){
     lostComments.forEach(function(comment){lostBox.appendChild(renderComment(comment));});
     diff.appendChild(lostBox);
   }
+  var quiz=getValidQuiz(step);
+  if(quiz) diff.appendChild(renderQuiz(stepNumber(step, stepIndex), quiz));
+  if(stepIndex===story.steps.length-1){
+    var summary=renderQuizSummary();
+    if(summary) diff.appendChild(summary);
+  }
   buildMinimap();
   updateMinimapViewport();
 }
-document.getElementById('prevBtn').onclick=function(){if(stepIndex>0){stepIndex--;render();window.scrollTo(0,0);}};
-document.getElementById('nextBtn').onclick=function(){if(stepIndex<story.steps.length-1){stepIndex++;render();window.scrollTo(0,0);}};
+document.getElementById('prevBtn').onclick=function(){if(stepIndex>0) goToStep(stepIndex-1);};
+document.getElementById('nextBtn').onclick=function(){if(canGoNext()) goToStep(stepIndex+1);};
 document.getElementById('followBtn').onclick=function(){
   var followBtn=document.getElementById('followBtn');
   var msg=document.getElementById('doneMsg');
@@ -1763,8 +1921,8 @@ window.addEventListener('resize', updateMinimapViewport);
 document.addEventListener('keydown', function(event){
   var tag=event.target&&event.target.tagName;
   if(tag==='INPUT'||tag==='TEXTAREA') return;
-  if(event.key==='ArrowLeft'&&stepIndex>0){stepIndex--;render();window.scrollTo(0,0);}
-  if(event.key==='ArrowRight'&&stepIndex<story.steps.length-1){stepIndex++;render();window.scrollTo(0,0);}
+  if(event.key==='ArrowLeft'&&stepIndex>0) goToStep(stepIndex-1);
+  if(event.key==='ArrowRight'&&canGoNext()) goToStep(stepIndex+1);
 });
 // ステップの番号とownsの中身、変更IDの件数を並べた文字列。ミニマップの中身はこれだけで決まる
 function minimapFingerprint(){
@@ -1772,9 +1930,9 @@ function minimapFingerprint(){
   var changePart=(story.change_ids||[]).length;
   return stepPart+'@'+changePart;
 }
-// ミニマップ用の指紋に題名・タイトル・説明文・refsの件数・コメントと返信の件数を加えた文字列。差分や追従、説明文の書き換えによる変化の検知に使う
+// ミニマップ用の指紋に題名・タイトル・説明文・refsの件数・クイズの問題文・コメントと返信の件数を加えた文字列。差分や追従、説明文の書き換えによる変化の検知に使う
 function storyFingerprint(minimapPart){
-  var stepPart=(story.steps||[]).map(function(step){return step.order+':'+step.title+':'+step.narration+':'+(step.refs||[]).length;}).join('|');
+  var stepPart=(story.steps||[]).map(function(step){return step.order+':'+step.title+':'+step.narration+':'+(step.refs||[]).length+':'+(step.quiz?step.quiz.question:'');}).join('|');
   var comments=story.comments||[];
   var commentPart=comments.length+'#'+comments.map(function(comment){return (comment.replies||[]).length;}).join(',');
   return minimapPart+'@'+story.title+'@'+stepPart+'@'+commentPart;
@@ -1941,6 +2099,20 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 .comment-form{margin:4px 12px 8px 46px;display:flex;gap:8px}
 .comment-form input{flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:13px}
 .lost-comments-heading{font-size:13px;font-weight:600;color:var(--text-soft)}
+.quiz-note{font-size:12px;color:var(--text-soft)}
+.quiz-heading{font-size:13px;font-weight:700;color:var(--accent);background:var(--accent-soft)}
+.quiz-question{padding:14px 16px;font-size:14px;line-height:1.7}
+.quiz-choices{display:flex;flex-direction:column;gap:8px;padding:0 16px}
+.quiz-choice{text-align:left;line-height:1.6;white-space:normal}
+.quiz-choice:disabled{opacity:1}
+.quiz-choice.correct{background:#e6f6ec;border-color:#a3d9b1;color:#1a7f37;font-weight:600}
+.quiz-choice.wrong{background:#ffebe9;border-color:#f0b1ab;color:#cf222e}
+.quiz-result{margin:14px 16px 0;padding:11px 14px;border-radius:8px;font-size:13px;line-height:1.7;background:#e6f6ec;border:1px solid #a3d9b1;color:#1a7f37}
+.quiz-result.miss{background:#ffebe9;border-color:#f0b1ab;color:#cf222e}
+.quiz-result.hint{background:var(--surface-soft);border-color:var(--border-soft);color:var(--text-soft)}
+.quiz-result-head{font-weight:700;margin-bottom:4px}
+.quiz-actions{display:flex;gap:8px;padding:14px 16px}
+.quiz-summary{background:var(--accent-soft);border:1px solid var(--accent);color:var(--accent);padding:14px 16px;border-radius:12px;font-weight:600;margin-bottom:20px}
 @media (prefers-color-scheme: dark){
   :root{
     --text-main:#e6edf3;
@@ -1955,6 +2127,10 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
   .done-btn:hover:not(:disabled){background:#5577ff}
   .banner-box{background:#2b2410;border-color:#5a4a1a;color:#e3c56b}
   .done-msg{background:#132a1a;border-color:#2f6b42;color:#5cc47f}
+  .quiz-choice.correct{background:#132a1a;border-color:#2f6b42;color:#5cc47f}
+  .quiz-choice.wrong{background:#291416;border-color:#6b2f2f;color:#f85149}
+  .quiz-result{background:#132a1a;border-color:#2f6b42;color:#5cc47f}
+  .quiz-result.miss{background:#291416;border-color:#6b2f2f;color:#f85149}
   .file-head .status{background:#2a2f38}
   .file-note{background:#0f141b}
   .add{background:#12261a}
@@ -1994,6 +2170,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 <span id='counter' class='counter'></span>
 <button id='prevBtn'>前へ</button>
 <button id='nextBtn'>次へ</button>
+<span id='quizNote' class='quiz-note'></span>
 <div class='view-toggle'>
 <button id='unifiedBtn' class='view-toggle-btn'>統合</button>
 <button id='splitBtn' class='view-toggle-btn active'>左右並列</button>
@@ -2049,6 +2226,14 @@ function main() {
       if (validation.unknown_files.length > 0) console.log("  不明なファイル: " + validation.unknown_files.join(", "));
       process.exit(1);
     }
+    const quizIssues = buildQuizIssues(steps.steps || []);
+    if (quizIssues.length > 0) {
+      console.log("ng: 理解度クイズの作りが正しくありません");
+      for (const issue of quizIssues) {
+        console.log("  step" + issue.order + " " + issue.title + " (" + issue.reasons.join(", ") + ")");
+      }
+      process.exit(1);
+    }
     const idToFileKey = new Map();
     for (const file of changes.files) {
       for (const line of file.lines) if (line.id != null) idToFileKey.set(line.id, file.repo + " " + file.file);
@@ -2069,7 +2254,9 @@ function main() {
       }
       process.exit(1);
     }
-    console.log("ok: 全 " + changes.change_ids.length + " 件の変更IDがちょうど1回ずつ owns に入っています");
+    const quizStepCount = (steps.steps || []).filter((step) => step.quiz != null).length;
+    const quizNote = quizStepCount > 0 ? "(理解度クイズ " + quizStepCount + "問)" : "";
+    console.log("ok: 全 " + changes.change_ids.length + " 件の変更IDがちょうど1回ずつ owns に入っています" + quizNote);
     if (advisory.length > 0) {
       console.log("参考 目安 " + CHANGED_LINES_PER_STEP_GUIDE + "行を超えるstep(浅く広い機械的変更や自動生成物ならこのままでよい。密な実装なら分割を検討):");
       for (const step of advisory) {
@@ -2180,3 +2367,5 @@ module.exports.remapComments = remapComments;
 module.exports.runPrep = runPrep;
 module.exports.resolveSteps = resolveSteps;
 module.exports.buildValidation = buildValidation;
+module.exports.buildQuizIssues = buildQuizIssues;
+module.exports.VIEWER_HTML = VIEWER_HTML;
