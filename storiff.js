@@ -17,6 +17,21 @@ const SAME_CONTENT_LINE_COUNT_MAX = 100;
 // 単調増加列を計算する候補の総数がこれを超えたら、計算をやめて出現順に対応させる
 const MONOTONIC_CANDIDATE_COUNT_MAX = 5000000;
 
+// 変更行がこの数を超えたら hints.txt の解析を省く
+const HINT_CHANGED_LINE_COUNT_MAX = 100000;
+
+// 同じ名前がこの数を超えて定義されていたら、ありふれた名前とみなして捨てる
+const HINT_DEFINITION_COUNT_MAX = 5;
+
+// hints.txt に並べる名前の数の上限
+const HINT_NAME_COUNT_MAX = 200;
+
+// これより短い名前は当たりが多すぎるので捨てる
+const HINT_NAME_LENGTH_MIN = 3;
+
+// 1つの名前について並べる使用箇所の数の上限
+const HINT_USE_COUNT_MAX = 20;
+
 // serve のデーモン起動を待つときのポーリング間隔と上限
 const SERVE_POLL_INTERVAL_MSEC = 200;
 const SERVE_START_TIMEOUT_MSEC = 10000;
@@ -153,6 +168,138 @@ function buildFilesMap(files) {
     return "F" + (index + 1) + " [" + range + "] (" + ids.length + ") " + file.status + " " + repoTag + file.file;
   });
   return lines.join("\n") + "\n";
+}
+
+// 名前を定義している行の見つけ方。1つ目の丸括弧が定義された名前になる
+// 関数と型はどの深さでも拾い、変数と定数は行頭のものだけ拾う。中に入り込んだ作業用の変数は手がかりにならない
+const JAVASCRIPT_DEFINITION_PATTERNS = [
+  /\b(?:function|class|interface|enum)\s+([A-Za-z_$][\w$]*)/g,
+  /^(?:export\s+)?(?:const|let|var|type)\s+([A-Za-z_$][\w$]*)/g,
+];
+const PYTHON_DEFINITION_PATTERNS = [
+  /\b(?:def|class)\s+([A-Za-z_]\w*)/g,
+  /^([A-Za-z_]\w*)\s*=(?!=)/g,
+];
+const GO_DEFINITION_PATTERNS = [
+  /\bfunc\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/g,
+  /^(?:type|const|var)\s+([A-Za-z_]\w*)/g,
+];
+
+// 拡張子ごとの定義の見つけ方。ここに無い言語は静かに飛ばす
+const DEFINITION_PATTERNS_BY_EXTENSION = {
+  ".js": JAVASCRIPT_DEFINITION_PATTERNS,
+  ".jsx": JAVASCRIPT_DEFINITION_PATTERNS,
+  ".mjs": JAVASCRIPT_DEFINITION_PATTERNS,
+  ".cjs": JAVASCRIPT_DEFINITION_PATTERNS,
+  ".ts": JAVASCRIPT_DEFINITION_PATTERNS,
+  ".tsx": JAVASCRIPT_DEFINITION_PATTERNS,
+  ".py": PYTHON_DEFINITION_PATTERNS,
+  ".go": GO_DEFINITION_PATTERNS,
+};
+
+// 行の中で使われている名前を拾う
+const IDENTIFIER_PATTERN = /[A-Za-z_$][\w$]*/g;
+
+// hints.txt の見出し。ヒントが参考でしかないことを、読む人にも AI にも先に伝える
+const HINTS_HEADER = [
+  "# 変更どうしのつながり(参考)",
+  "# 名前の見た目だけで拾った手がかりなので外れも混ざる。ステップの境界は意図で決める",
+  "",
+].join("\n");
+
+// 拡張子から定義の見つけ方を選ぶ。対応していない言語は null
+function findDefinitionPatterns(filePath) {
+  if (filePath == null) return null;
+  const dotIndex = filePath.lastIndexOf(".");
+  if (dotIndex === -1) return null;
+  return DEFINITION_PATTERNS_BY_EXTENSION[filePath.slice(dotIndex)] || null;
+}
+
+// 変更行のうち名前を定義している行を、名前ごとにまとめる
+function collectDefinitions(files) {
+  const definitionsByName = new Map();
+  for (const file of files) {
+    const definitionPatterns = findDefinitionPatterns(file.file);
+    if (definitionPatterns == null) continue;
+    for (const line of file.lines) {
+      if (line.id == null) continue;
+      for (const pattern of definitionPatterns) {
+        for (const matched of line.text.matchAll(pattern)) {
+          const name = matched[1];
+          if (name.length < HINT_NAME_LENGTH_MIN) continue;
+          const definition = definitionsByName.get(name);
+          if (definition == null) {
+            definitionsByName.set(name, { file: file.file, definitionIds: [line.id], useIds: [], useCount: 0, lastUseId: null });
+            continue;
+          }
+          if (definition.definitionIds.length > HINT_DEFINITION_COUNT_MAX) continue;
+          if (definition.definitionIds[definition.definitionIds.length - 1] !== line.id) definition.definitionIds.push(line.id);
+        }
+      }
+    }
+  }
+  return definitionsByName;
+}
+
+// 定義済みの名前が、定義した行とは別の変更行で使われている数を数える
+function countUses(files, definitionsByName) {
+  if (definitionsByName.size === 0) return;
+  for (const file of files) {
+    for (const line of file.lines) {
+      if (line.id == null) continue;
+      for (const matched of line.text.matchAll(IDENTIFIER_PATTERN)) {
+        const definition = definitionsByName.get(matched[0]);
+        if (definition == null) continue;
+        if (definition.lastUseId === line.id) continue;
+        if (definition.definitionIds.includes(line.id)) continue;
+        definition.lastUseId = line.id;
+        definition.useCount += 1;
+        if (definition.useIds.length < HINT_USE_COUNT_MAX) definition.useIds.push(line.id);
+      }
+    }
+  }
+}
+
+// story作成時に読む手がかり。ここで定義した名前をあそこで使っている、という関係を並べる
+// 定義を先に集め、次の周回では定義済みの名前だけを数えるので、変更行数に対して線形に収まる
+function buildHintsText(files) {
+  let changedLineCount = 0;
+  for (const file of files) {
+    for (const line of file.lines) {
+      if (line.id != null) changedLineCount += 1;
+    }
+  }
+  if (changedLineCount > HINT_CHANGED_LINE_COUNT_MAX) return HINTS_HEADER + "変更行が多すぎるので解析を省きました\n";
+
+  const definitionsByName = collectDefinitions(files);
+  countUses(files, definitionsByName);
+  const hintLines = [];
+  let skippedNameCount = 0;
+  for (const [name, definition] of definitionsByName) {
+    if (definition.useCount === 0) continue;
+    if (definition.definitionIds.length > HINT_DEFINITION_COUNT_MAX) continue;
+    if (hintLines.length >= HINT_NAME_COUNT_MAX) {
+      skippedNameCount += 1;
+      continue;
+    }
+    const hiddenUseCount = definition.useCount - definition.useIds.length;
+    const hiddenUseNote = hiddenUseCount > 0 ? "(ほか " + hiddenUseCount + " 件)" : "";
+    const definitionText = "変更ID " + definition.definitionIds.join(", ") + " で定義し";
+    const useText = "変更ID " + definition.useIds.join(", ") + " が使っています";
+    hintLines.push(definition.file + " の " + name + " を " + definitionText + "、" + useText + hiddenUseNote);
+  }
+  if (hintLines.length === 0) return HINTS_HEADER + "手がかりは見つかりませんでした\n";
+  if (skippedNameCount > 0) hintLines.push("ほか " + skippedNameCount + " 件の名前は省きました");
+  return HINTS_HEADER + hintLines.join("\n") + "\n";
+}
+
+// 解析に失敗しても prep 全体は止めず、失敗したことだけを書き残す
+function buildHintsTextOrNote(files) {
+  try {
+    return buildHintsText(files);
+  } catch (error) {
+    return HINTS_HEADER + "解析に失敗しました(" + String(error.message).split("\n")[0].trim() + ")\n";
+  }
 }
 
 // リポジトリとファイルと行の種類と本文から、突き合わせ用のキーを組み立てる
@@ -458,8 +605,10 @@ function runPrep(targetDir, repoList, hasExplicitArgs) {
   };
   const changesText = buildChangesText(files);
   const filesMapText = buildFilesMap(files);
+  const hintsText = buildHintsTextOrNote(files);
   const textOutputPath = path.join(targetDir, "changes.txt");
   const filesMapPath = path.join(targetDir, "files.txt");
+  const hintsPath = path.join(targetDir, "hints.txt");
   const excludedNote = excludedCount > 0 ? ", ノイズ除外 " + excludedCount + "件" : "";
 
   let previousComments = null;
@@ -505,7 +654,8 @@ function runPrep(targetDir, repoList, hasExplicitArgs) {
   writeFileAtomic(outputPath, JSON.stringify(changesJson, null, 2));
   writeFileAtomic(textOutputPath, changesText);
   writeFileAtomic(filesMapPath, filesMapText);
-  console.log("生成: " + outputPath + " と " + textOutputPath + " と " + filesMapPath + " (変更ID " + changeIds.length + "件, ファイル " + files.length + "件, リポジトリ " + repos.length + "件" + excludedNote + ")");
+  writeFileAtomic(hintsPath, hintsText);
+  console.log("生成: " + outputPath + " と " + textOutputPath + " と " + filesMapPath + " と " + hintsPath + " (変更ID " + changeIds.length + "件, ファイル " + files.length + "件, リポジトリ " + repos.length + "件" + excludedNote + ")");
   if (config.quiz) console.log("理解度クイズ: 有効。各ステップに quiz を1問つける");
   if (!isFollow) return;
   if (!isSameAsBefore) {
@@ -2359,6 +2509,8 @@ if (require.main === module) main();
 module.exports.buildFileDiffText = buildFileDiffText;
 module.exports.buildAskPrompt = buildAskPrompt;
 module.exports.askHaiku = askHaiku;
+module.exports.buildHintsText = buildHintsText;
+module.exports.buildHintsTextOrNote = buildHintsTextOrNote;
 module.exports.buildLineKeyIndex = buildLineKeyIndex;
 module.exports.buildIdMap = buildIdMap;
 module.exports.foldIdsToRanges = foldIdsToRanges;
