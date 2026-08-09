@@ -9,17 +9,19 @@ storiff.js(Node単一ファイル)とビューア、skill が共有する契約�
 - 追従: 2回目以降の prep が、前回の changes.json と steps.json を新しい差分に合わせて書き直すこと
 
 ## storiff.js の使い方
-- `node storiff.js prep <dir> [--repo P [範囲]]...` : 差分を解析し `<dir>/changes.json` と `<dir>/changes.txt` と `<dir>/files.txt` と `<dir>/hints.txt` を書き出す。差分の取得は引数なしなら `git diff HEAD`、範囲(`main...HEAD` など)を後ろに付ければ `git diff <範囲>`。ステージ済みの変更も差分に入る。`--repo <path> [範囲]` を並べると複数リポジトリを1つにまとめ変更IDを通し番号にする。変更なしなら何も書かない。git diff に失敗したときは1行のメッセージを出して中断する
+- `node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote]` : 差分を解析し `<dir>/changes.json` と `<dir>/changes.txt` と `<dir>/files.txt` と `<dir>/hints.txt` と `<dir>/context.txt` を書き出す。差分の取得は引数なしなら `git diff HEAD`、範囲(`main...HEAD` など)を後ろに付ければ `git diff <範囲>`。ステージ済みの変更も差分に入る。`--repo <path> [範囲]` を並べると複数リポジトリを1つにまとめ変更IDを通し番号にする。変更なしなら何も書かない。git diff に失敗したときは1行のメッセージを出して中断する
   - `<dir>` に `changes.json` と `steps.json` の両方がすでにあれば追従になる。どちらか欠けていれば初回として書き出す。詳しくは「追従」を参照
+  - `--with-remote` を付けたときだけ `gh` で GitHub の PR と課題を読む。付けなければ手元の git だけで完結し、差分もリポジトリの情報も外に出ない。詳しくは「context.txt」を参照
 - `node storiff.js check <dir>` : `steps.json` を検算し、抜けID・重複ID・不明ファイルを表示する。ok なら `ok: 全 N 件の変更IDがちょうど1回ずつ owns に入っています` と出し、quiz を持つステップが1つでもあれば末尾に `(理解度クイズ M問)` を足す。quiz を持つステップは作りも確かめ、不備があれば ng にして理由を並べる。1stepの変更行が目安(80行)を超えると参考として一覧に出し、目安の2倍を超えてかつ複数ファイルにまたがると ng になり分割を求める
 - `node storiff.js reply <dir> <コメント番号> <本文>` : comments.json の指定コメント(並び順1始まり)の `replies` に AI の返信を追記する
 - `node storiff.js serve <dir> [--port N] [--host H] [--session-id ID]` : ビューアを配信する常駐プロセスを裏で立ち上げ、URLだけすぐ返す。裏のプロセスは changes.json と steps.json を読み、`<dir>/close.flag` で終了する(`done.flag` では止まらない)。ログは `<dir>/serve.log`、起動情報は `<dir>/serve.json`(pid・port・host・url・session_id・started_at)に書く。同じ dir でもう一度実行すると、serve.json の pid が生きていて `/health` に応答すれば新しく起動せず既存のビューアに接続する。このとき `--session-id` を渡すと serve.json の session_id を渡した値に更新する。`--daemon` は裏のプロセス自身が使う内部フラグ。`--session-id` を渡すと、行コメントに haiku がその場で返信する。バインド先は既定 127.0.0.1、`--host 0.0.0.0` で外部からホスト名で見られる
 - バインド先は `~/.storiff/config.json` の `host` でも指定できる(`{"host": "0.0.0.0"}`)。CLI の `--host` が優先
 - 理解度クイズは `~/.storiff/config.json` の `quiz` が true のときだけ作る(`{"quiz": true}`)。true なら prep が生成の行に続けて `理解度クイズ: 有効。各ステップに quiz を1問つける` と出す。skill はこの1行を見て quiz を作るかどうかを決める。設定が無ければ何も出さず、quiz の無い steps.json になる。設定を読むのは prep だけなので、書き換えた後は同じ `<dir>` で prep を叩き直すまで skill に伝わらない
+- `~/.storiff/config.json` に `{"with_remote": true}` と書くと、毎回 `--with-remote` を付けたのと同じになる。既定は false
 
-`changes.json` `changes.txt` `files.txt` `hints.txt` `steps.json` `comments.json` `follow.json` `serve.json` はすべて一時ファイルに書いてから同じディレクトリ内で差し替える。書き込みの途中で別プロセスが読みにいっても、壊れた内容を掴むことはない
+`changes.json` `changes.txt` `files.txt` `hints.txt` `context.txt` `steps.json` `comments.json` `follow.json` `serve.json` はすべて一時ファイルに書いてから同じディレクトリ内で差し替える。書き込みの途中で別プロセスが読みにいっても、壊れた内容を掴むことはない
 
-依存は Node 組み込みのみ(http, fs, path, child_process, os)。Node 20+。`--session-id` を渡したときの行コメント返信(askHaiku)だけは外部の `claude` コマンドを子プロセスで呼ぶ。
+依存は Node 組み込みのみ(http, fs, path, child_process, os)。Node 20+。`--session-id` を渡したときの行コメント返信(askHaiku)だけは外部の `claude` コマンドを子プロセスで呼ぶ。context.txt を集めるときは `git`、`--with-remote` を付けたときだけ `gh` も子プロセスで呼ぶ。
 
 ## changes.json(prep が生成)
 ```json
@@ -28,6 +30,7 @@ storiff.js(Node単一ファイル)とビューア、skill が共有する契約�
   "repos": ["."],
   "repo_args": [{"path": ".", "diffArgs": []}],
   "cwd": "/path/to/repo",
+  "with_remote": false,
   "files": [
     {
       "repo": ".",
@@ -48,6 +51,7 @@ storiff.js(Node単一ファイル)とビューア、skill が共有する契約�
 - repo はそのファイルが属するリポジトリのパス。単一リポジトリなら "."。複数でも変更IDは全体で通し番号
 - repo_args: prep に渡されたリポジトリと範囲の指定。追従で同じ範囲を再実行するために使う
 - cwd: 初回 prep を実行した場所。リポジトリのパスが相対指定のときの起点。追従では前回の値を引き継ぐ
+- with_remote: context.txt を集めるときに GitHub まで見にいったかどうか。一度 true になった `<dir>` は、追従で `--with-remote` を渡し直さなくても同じ材料を集める
 
 ## changes.txt(prep が生成、ストーリー作成時に読むスリム版)
 コンテキスト行を落とし、変更行(add と del)だけを持つ。
@@ -95,6 +99,56 @@ src/api.js の fetchUser を 変更ID 12 で定義し、変更ID 45, 46 が使�
 - 変更行が10万行を超えたら解析を省き、`変更行が多すぎるので解析を省きました` の1行になる
 - 計算量は変更行数に比例する。JavaScript の差分で 4万行が 60ミリ秒と13MB、10万行が 148ミリ秒と28MB。追従の対応表(4万行で6.6秒と1345MB)と違って上限まで素直に伸びる
 
+## context.txt(prep が生成、なぜそうしたかの材料)
+
+差分のテキストだけでは「何をしたか」しか分からない。「なぜ必要だったか」と「他の案をなぜ選ばなかったか」は差分の外に散っているので、prep が集めて1つのテキストにする。ストーリーを作るサブエージェントが changes.txt より先に読む。
+
+```
+=== ブランチ ===
+feature/ABC-123-login
+
+=== コミット ===
+a1b2c3d 2026-08-01 山田 太郎
+  ログインを足す
+  手で入れていた確認が漏れるので自動にした
+  Refs #45
+
+=== 課題番号 ===
+ABC-123 #45
+
+=== PR ===
+#7 ログインを追加する
+https://github.com/example/repo/pull/7
+社内からの要望で必要になった
+--- leader ---
+別の案は運用が重いので選ばなかった
+
+=== 関係しそうな説明ファイル ===
+src/README.md
+CLAUDE.md
+```
+
+集める材料
+
+| 見出し | 中身 | 取り方 |
+| --- | --- | --- |
+| ブランチ | いまのブランチ名。課題番号が入っていることが多い | `git rev-parse --abbrev-ref HEAD` |
+| コミット | その差分に含まれるコミットの件名と本文。本文の Co-authored-by や Refs もそのまま残す | `git log <範囲>` |
+| 課題番号 | ブランチ名とコミットのメッセージから拾った `#12` と `ABC-123` | 文字列から拾う |
+| PR | 対応する PR の説明とコメントとレビューの本文 | `gh pr view --json`。`--with-remote` のときだけ |
+| 課題 | 拾った課題番号のうち `#12` の形のものの説明とコメント | `gh issue view --json`。`--with-remote` のときだけ |
+| 関係しそうな説明ファイル | 変更したファイルから上へたどって見つかった `CLAUDE.md` `AGENTS.md` `README.md` の場所。中身は入れず場所だけ | ファイルの有無 |
+
+- 複数リポジトリのときは見出しにリポジトリのパスが付く。例 `=== repoB コミット ===`
+- コミットの範囲は prep に渡した範囲から決める。範囲なし(作業中の変更)ならコミットは0件。`main...HEAD` は `main..HEAD`、`HEAD~3` は `HEAD~3..HEAD` として読む
+- 取れなかった材料は見出しごと出さない。git が失敗しても gh が入っていなくてもログインしていなくてもネットに出られなくても、prep は止まらず取れた分だけ書く
+- 材料が1つも無ければ空のファイルになる。ストーリー作りは今までどおり files.txt と changes.txt と hints.txt だけで進む
+- 追従でも毎回集め直す。ブランチや新しいコミットが増えていれば context.txt も新しくなる
+- 上限は、コミット30件、コミット1件の本文20行、課題番号10件、説明ファイル20件、PR と課題の本文4000文字、コメント1件1000文字、コメント20件、全体で60000文字。超えた分は切って `(長いのでここまで)` を足す
+- 外部コマンドは15秒で打ち切る。ネットが繋がらない環境で `--with-remote` を付けても待ち続けない
+
+`--with-remote` を付けない限り、prep は手元の git しか呼ばない。差分もリポジトリの名前も外に出ない。付けたときは `gh` がそのリポジトリの PR と課題を GitHub から読む(こちらから差分を送りはしない)。一度 `--with-remote` で作った `<dir>` は changes.json の `with_remote` が true になり、ビューアの「差分を取り込む」ボタンからの追従でも同じ材料を集める
+
 ## steps.json(skill が生成)
 ```json
 {
@@ -135,7 +189,7 @@ src/api.js の fetchUser を 変更ID 12 で定義し、変更ID 45, 46 が使�
 6. 移設は追加(移設先)と削除(移設元)を必ず同じステップに対で入れる。作業の種類で割らない
 7. owns_files で丸ごと1ステップにしてよいのは、小さいファイルか不可分な追加(自動生成物など)だけ。変更行が多いファイルは changes.txt を読んで割る
 8. タイトル一覧が「新設」「削除」のように種類先行で並んだら割り直す
-9. narration には背景と理由を書く。そのステップだけで他人に説明できる分量にする。一文で終わらせない
+9. narration には背景と理由を書く。何をしたかで止めず、なぜ必要だったかと、他の案をなぜ選ばなかったかまで書く。材料は context.txt にある。そこにもコードにも無いことは書かず、材料が無いステップはコードから読み取れることだけにする。そのステップだけで他人に説明できる分量にし、一文で終わらせない
 10. `node storiff.js check <dir>` で確認する。大きく複数ファイルにまたがるステップは ng になるので分割する
 
 ## 理解度クイズ
@@ -176,6 +230,7 @@ src/api.js の fetchUser を 変更ID 12 で定義し、変更ID 45, 46 が使�
 - title と narration と quiz はそのまま引き継ぐ。書き換わるのは owns と refs だけ
 - 対応の取れなかった新IDは末尾の「修正N回目」ステップに入る。narration は空で、後で人か AI が書く
 - コメントの change_id も新IDに写る。写せないコメントは change_id が null になり、body と replies は残る。ビューアは「修正で無くなった行へのコメント」としてステップの末尾に出す。どのステップにも属さないコメントも最後のステップに寄る
+- context.txt は追従のたびに集め直して書き直す。ブランチを切り替えたり新しくコミットしたりすると中身も新しくなる
 - 追従で差分が0件になったときは書き換えず、既存のストーリーをそのまま残す。ここで書き換えると全ステップの owns が空になるため
 - 前回とまったく同じ差分だったとき、つまり消えた行と増えた行がどちらも0件で、かつ旧IDと新IDの対応表がすべて同じ番号どうしの対応(恒等)だったときも書き換えない。steps.json と comments.json はもちろん、follow.json も控え(steps.prev.json と comments.prev.json)も作られない
 - 前回の changes.json が読み込めないか、files を持たない形か、files の要素に lines が無い形のときは1行のメッセージを出して中断する。既存のファイルは書き換えない。steps.json や comments.json が壊れているときも、CLI は1行のメッセージにして中断する

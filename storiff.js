@@ -525,7 +525,187 @@ function matchesFilePattern(filePath, patterns) {
   });
 }
 
-function runPrep(targetDir, repoList, hasExplicitArgs) {
+// 意図の材料の上限。巨大なPRのコメント欄などで context.txt が膨らみすぎないようにする
+const CONTEXT_COMMAND_TIMEOUT_MSEC = 15000;
+const CONTEXT_COMMIT_BODY_LINE_MAX = 20;
+const CONTEXT_COMMIT_COUNT_MAX = 30;
+const CONTEXT_DOC_PATH_COUNT_MAX = 20;
+const CONTEXT_ISSUE_NUMBER_COUNT_MAX = 10;
+const CONTEXT_REMOTE_BODY_CHAR_MAX = 4000;
+const CONTEXT_REMOTE_COMMENT_CHAR_MAX = 1000;
+const CONTEXT_REMOTE_COMMENT_COUNT_MAX = 20;
+const CONTEXT_REMOTE_ISSUE_COUNT_MAX = 3;
+const CONTEXT_TOTAL_CHAR_MAX = 60000;
+
+// 変更したファイルの近くにあると、そのコードの狙いが書かれていることが多い説明ファイル
+const CONTEXT_DOC_FILE_NAMES = ["CLAUDE.md", "AGENTS.md", "README.md"];
+
+// 課題番号らしき書き方。GitHub の #12 と JIRA 風の ABC-123
+const ISSUE_NUMBER_REGEXP = /#\d+|\b[A-Z][A-Z0-9]{1,9}-\d+\b/g;
+
+// 材料集めの外部コマンド。入っていない、失敗した、返事が無いときは null を返し、prep 全体は止めない
+function runCommandOrNull(command, commandArgs, cwd) {
+  try {
+    return execFileSync(command, commandArgs, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: CONTEXT_COMMAND_TIMEOUT_MSEC, maxBuffer: 1024 * 1024 * 8 });
+  } catch {
+    return null;
+  }
+}
+
+// 長い本文を上限で切る。切ったときは切ったと分かるようにする
+function cutText(text, charMax) {
+  const trimmedText = String(text == null ? "" : text).trim();
+  if (trimmedText.length <= charMax) return trimmedText;
+  return trimmedText.slice(0, charMax) + "\n(長いのでここまで)";
+}
+
+// git diff の範囲指定から、その差分に含まれるコミットを読む git log の範囲を組み立てる
+// 範囲を指定していないときは作業中の変更なのでコミットが無く、null を返す
+function buildCommitRange(diffArgs) {
+  const revisions = diffArgs.filter((arg) => !arg.startsWith("-"));
+  if (revisions.length === 0) return null;
+  if (revisions.length >= 2) return revisions[0] + ".." + revisions[1];
+  if (revisions[0] === "HEAD") return null;
+  if (revisions[0].includes("..")) return revisions[0].replace("...", "..");
+  return revisions[0] + "..HEAD";
+}
+
+// 範囲に含まれるコミットの件名と本文を読む。本文の Co-authored-by や Refs もそのまま残す
+function collectCommits(repoPath, commitRange) {
+  if (commitRange == null) return [];
+  const logArgs = ["log", commitRange, "--no-merges", "--max-count=" + CONTEXT_COMMIT_COUNT_MAX, "--date=short", "--pretty=format:%h%x00%ad%x00%an%x00%s%x00%b%x01"];
+  const logText = runCommandOrNull("git", logArgs, repoPath);
+  if (logText == null) return [];
+  const commits = [];
+  for (const record of logText.split("\x01")) {
+    const columns = record.trim().split("\x00");
+    if (columns.length < 5) continue;
+    commits.push({ hash: columns[0], date: columns[1], author: columns[2], subject: columns[3], body: columns[4] });
+  }
+  return commits;
+}
+
+// コミット1件を、件名と本文を字下げした形にする
+function formatCommit(commit) {
+  const bodyLines = commit.body.split("\n").map((line) => line.trim()).filter((line) => line !== "").slice(0, CONTEXT_COMMIT_BODY_LINE_MAX);
+  const heading = commit.hash + " " + commit.date + " " + commit.author;
+  return [heading, "  " + commit.subject].concat(bodyLines.map((line) => "  " + line)).join("\n");
+}
+
+// コミットのメッセージとブランチ名から課題番号を拾う
+function collectIssueNumbers(texts) {
+  const issueNumbers = [];
+  for (const text of texts) {
+    for (const matched of String(text).match(ISSUE_NUMBER_REGEXP) || []) {
+      if (!issueNumbers.includes(matched)) issueNumbers.push(matched);
+    }
+  }
+  return issueNumbers.slice(0, CONTEXT_ISSUE_NUMBER_COUNT_MAX);
+}
+
+// gh で GitHub を読む。gh が無い、ログインしていない、GitHub ではない、ネットに出られないときは null
+function fetchGithubJson(repoPath, ghArgs) {
+  const jsonText = runCommandOrNull("gh", ghArgs, repoPath);
+  if (jsonText == null) return null;
+  try {
+    return JSON.parse(jsonText);
+  } catch {
+    return null;
+  }
+}
+
+// いまのブランチに対応する PR の説明とコメントを読む
+function fetchPullRequest(repoPath) {
+  return fetchGithubJson(repoPath, ["pr", "view", "--json", "number,title,url,body,comments,reviews"]);
+}
+
+// 課題番号に対応する issue の説明とコメントを読む
+function fetchIssue(repoPath, issueNumber) {
+  return fetchGithubJson(repoPath, ["issue", "view", issueNumber.replace("#", ""), "--json", "number,title,url,body,comments"]);
+}
+
+// PR や issue に付いたコメントを、書いた人ごとに並べる
+function formatRemarks(remarks) {
+  return remarks
+    .filter((remark) => remark != null && String(remark.body == null ? "" : remark.body).trim() !== "")
+    .slice(0, CONTEXT_REMOTE_COMMENT_COUNT_MAX)
+    .map((remark) => "--- " + (remark.author && remark.author.login ? remark.author.login : "不明") + " ---\n" + cutText(remark.body, CONTEXT_REMOTE_COMMENT_CHAR_MAX))
+    .join("\n");
+}
+
+// PR や issue を、番号と見出しとURLと本文とコメントの形にする
+function formatGithubItem(item) {
+  const remarks = (item.comments || []).concat(item.reviews || []);
+  const parts = ["#" + item.number + " " + item.title, item.url, cutText(item.body, CONTEXT_REMOTE_BODY_CHAR_MAX), formatRemarks(remarks)];
+  return parts.filter((part) => part != null && part !== "").join("\n");
+}
+
+// 1リポジトリ分の意図の材料を集める。取れなかった材料は静かに飛ばし、取れた分だけ返す
+function collectRepoContext(repo, repoPath, diffArgs, useRemote) {
+  const branchText = runCommandOrNull("git", ["rev-parse", "--abbrev-ref", "HEAD"], repoPath);
+  const branchName = branchText == null ? "" : branchText.trim();
+  const commits = collectCommits(repoPath, buildCommitRange(diffArgs));
+  const issueNumbers = collectIssueNumbers([branchName].concat(commits.map((commit) => commit.subject + "\n" + commit.body)));
+  const pullRequest = useRemote ? fetchPullRequest(repoPath) : null;
+  const issues = [];
+  if (useRemote) {
+    const githubIssueNumbers = issueNumbers.filter((issueNumber) => issueNumber.startsWith("#")).slice(0, CONTEXT_REMOTE_ISSUE_COUNT_MAX);
+    for (const githubIssueNumber of githubIssueNumbers) {
+      const issue = fetchIssue(repoPath, githubIssueNumber);
+      if (issue != null) issues.push(issue);
+    }
+  }
+  return { repo, branchName, commits, issueNumbers, pullRequest, issues };
+}
+
+// 変更したファイルから上のディレクトリへたどり、近くにある説明ファイルの場所を集める
+function collectDocPaths(files, repoPathMap) {
+  const docPaths = [];
+  for (const file of files) {
+    const repoPath = repoPathMap.get(file.repo);
+    if (repoPath == null || !file.file) continue;
+    const repoTag = file.repo && file.repo !== "." ? file.repo + " " : "";
+    let currentDir = path.dirname(file.file);
+    while (true) {
+      for (const docFileName of CONTEXT_DOC_FILE_NAMES) {
+        const docPath = currentDir === "." ? docFileName : currentDir + "/" + docFileName;
+        if (docPaths.includes(repoTag + docPath)) continue;
+        if (fs.existsSync(path.resolve(repoPath, docPath))) docPaths.push(repoTag + docPath);
+      }
+      if (currentDir === ".") break;
+      currentDir = path.dirname(currentDir);
+    }
+  }
+  return docPaths.slice(0, CONTEXT_DOC_PATH_COUNT_MAX);
+}
+
+// 集めた材料を1つのテキストにまとめる。取れなかった材料は見出しごと出さない
+function buildContextText(repoContexts, docPaths) {
+  const blocks = [];
+  for (const repoContext of repoContexts) {
+    const repoTag = repoContext.repo && repoContext.repo !== "." ? repoContext.repo + " " : "";
+    if (repoContext.branchName !== "" && repoContext.branchName !== "HEAD") {
+      blocks.push("=== " + repoTag + "ブランチ ===\n" + repoContext.branchName);
+    }
+    if (repoContext.commits.length > 0) {
+      blocks.push("=== " + repoTag + "コミット ===\n" + repoContext.commits.map((commit) => formatCommit(commit)).join("\n\n"));
+    }
+    if (repoContext.issueNumbers.length > 0) {
+      blocks.push("=== " + repoTag + "課題番号 ===\n" + repoContext.issueNumbers.join(" "));
+    }
+    if (repoContext.pullRequest != null) {
+      blocks.push("=== " + repoTag + "PR ===\n" + formatGithubItem(repoContext.pullRequest));
+    }
+    for (const issue of repoContext.issues) {
+      blocks.push("=== " + repoTag + "課題 ===\n" + formatGithubItem(issue));
+    }
+  }
+  if (docPaths.length > 0) blocks.push("=== 関係しそうな説明ファイル ===\n" + docPaths.join("\n"));
+  if (blocks.length === 0) return "";
+  return cutText(blocks.join("\n\n"), CONTEXT_TOTAL_CHAR_MAX) + "\n";
+}
+
+function runPrep(targetDir, repoList, hasExplicitArgs, withRemote) {
   cleanupStaleTempFiles(targetDir);
   const changesPath = path.join(targetDir, "changes.json");
   let previousChanges = null;
@@ -548,8 +728,12 @@ function runPrep(targetDir, repoList, hasExplicitArgs) {
   if (usingRecordedRepoList) console.log("記録済みの範囲を使います: " + previousChanges.diff_target);
   const effectiveRepoList = usingRecordedRepoList ? previousChanges.repo_args : repoList;
   const cwd = usingRecordedRepoList ? previousChanges.cwd || process.cwd() : process.cwd();
+  const config = loadConfig();
+  const useRemote = withRemote === true || config.with_remote === true || (hasPreviousChanges && previousChanges.with_remote === true);
   const collectedFiles = [];
   const diffTargets = [];
+  const repoContexts = [];
+  const repoPathMap = new Map();
   for (const repo of effectiveRepoList) {
     const repoPath = usingRecordedRepoList ? path.resolve(cwd, repo.path) : repo.path;
     const diffArgs = repo.diffArgs.length > 0 ? repo.diffArgs : ["HEAD"];
@@ -565,8 +749,9 @@ function runPrep(targetDir, repoList, hasExplicitArgs) {
     diffTargets.push(repo.path === "." ? range : repo.path + " " + range);
     if (diffText.trim() === "") continue;
     collectedFiles.push(...parseDiff(diffText, repo.path, 1).files);
+    repoContexts.push(collectRepoContext(repo.path, repoPath, diffArgs, useRemote));
+    repoPathMap.set(repo.path, repoPath);
   }
-  const config = loadConfig();
   const excludePatterns = NOISE_PATTERNS.concat(config.exclude || []);
   const reviewableFiles = collectedFiles.filter((file) => !matchesFilePattern(file.file, excludePatterns));
   const excludedCount = collectedFiles.length - reviewableFiles.length;
@@ -600,15 +785,19 @@ function runPrep(targetDir, repoList, hasExplicitArgs) {
     repos,
     repo_args: effectiveRepoList,
     cwd,
+    with_remote: useRemote,
     files,
     change_ids: changeIds,
   };
   const changesText = buildChangesText(files);
   const filesMapText = buildFilesMap(files);
   const hintsText = buildHintsTextOrNote(files);
+  const docPaths = collectDocPaths(files, repoPathMap);
+  const contextText = buildContextText(repoContexts, docPaths);
   const textOutputPath = path.join(targetDir, "changes.txt");
   const filesMapPath = path.join(targetDir, "files.txt");
   const hintsPath = path.join(targetDir, "hints.txt");
+  const contextPath = path.join(targetDir, "context.txt");
   const excludedNote = excludedCount > 0 ? ", ノイズ除外 " + excludedCount + "件" : "";
 
   let previousComments = null;
@@ -655,7 +844,14 @@ function runPrep(targetDir, repoList, hasExplicitArgs) {
   writeFileAtomic(textOutputPath, changesText);
   writeFileAtomic(filesMapPath, filesMapText);
   writeFileAtomic(hintsPath, hintsText);
+  writeFileAtomic(contextPath, contextText);
   console.log("生成: " + outputPath + " と " + textOutputPath + " と " + filesMapPath + " と " + hintsPath + " (変更ID " + changeIds.length + "件, ファイル " + files.length + "件, リポジトリ " + repos.length + "件" + excludedNote + ")");
+  if (contextText !== "") {
+    const commitCount = repoContexts.reduce((total, repoContext) => total + repoContext.commits.length, 0);
+    const remoteItemCount = repoContexts.reduce((total, repoContext) => total + (repoContext.pullRequest == null ? 0 : 1) + repoContext.issues.length, 0);
+    const remoteNote = useRemote ? ", PRと課題 " + remoteItemCount + "件" : "";
+    console.log("意図の材料: " + contextPath + " (コミット " + commitCount + "件, 説明ファイル " + docPaths.length + "件" + remoteNote + ")");
+  }
   if (config.quiz) console.log("理解度クイズ: 有効。各ステップに quiz を1問つける");
   if (!isFollow) return;
   if (!isSameAsBefore) {
@@ -2349,7 +2545,7 @@ function main() {
   const command = args[0];
   const targetDir = args[1];
   if (!command || !targetDir) {
-    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... | node storiff.js check <dir> | node storiff.js reply <dir> <コメント番号> <本文> | node storiff.js serve <dir> [--port N] [--host H]");
+    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] | node storiff.js check <dir> | node storiff.js reply <dir> <コメント番号> <本文> | node storiff.js serve <dir> [--port N] [--host H]");
     process.exit(1);
   }
   if (command === "check") {
@@ -2435,7 +2631,8 @@ function main() {
     const globalDiffArgs = [];
     const repoList = [];
     let currentRepo = null;
-    const rest = args.slice(2);
+    const withRemote = args.slice(2).includes("--with-remote");
+    const rest = args.slice(2).filter((arg) => arg !== "--with-remote");
     for (let index = 0; index < rest.length; index++) {
       if (rest[index] === "--repo" && rest[index + 1]) {
         currentRepo = { path: rest[index + 1], diffArgs: [] };
@@ -2456,7 +2653,7 @@ function main() {
       }
     }
     try {
-      runPrep(targetDir, repoList, hasExplicitArgs);
+      runPrep(targetDir, repoList, hasExplicitArgs, withRemote);
     } catch (error) {
       console.log("追従しません: steps.json か comments.json が壊れています(" + String(error.message).split("\n")[0].trim() + ")");
       process.exit(1);
@@ -2517,6 +2714,11 @@ module.exports.foldIdsToRanges = foldIdsToRanges;
 module.exports.remapSteps = remapSteps;
 module.exports.remapComments = remapComments;
 module.exports.runPrep = runPrep;
+module.exports.buildCommitRange = buildCommitRange;
+module.exports.collectIssueNumbers = collectIssueNumbers;
+module.exports.collectDocPaths = collectDocPaths;
+module.exports.buildContextText = buildContextText;
+module.exports.fetchPullRequest = fetchPullRequest;
 module.exports.resolveSteps = resolveSteps;
 module.exports.buildValidation = buildValidation;
 module.exports.buildQuizIssues = buildQuizIssues;

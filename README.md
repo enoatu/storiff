@@ -26,6 +26,16 @@
 
 外部のツールも npm も使わず、名前の見た目だけで拾う。対応は JavaScript と TypeScript と Python と Go で、それ以外の言語は静かに飛ばす。あくまで参考なので、ヒントが空でもストーリーは今まで通り作れる。詳しくは [docs/story-schema.md](docs/story-schema.md) を参照。
 
+## なぜそうしたかの材料
+差分のテキストだけでは「何をしたか」しか読み取れず、説明がコードの言い換えになりやすい。そこで差分を書き出すときに、意図の材料も `context.txt` に集めてストーリー作りに渡す。
+
+- ブランチ名と、その差分に含まれるコミットの本文(Co-authored-by や Refs もそのまま)
+- ブランチ名とコミットから拾った課題番号(`#12` や `ABC-123`)
+- 変更したファイルの近くにある `CLAUDE.md` `AGENTS.md` `README.md` の場所
+- `--with-remote` を付けたときだけ、`gh` で読んだ PR と課題の説明とコメント
+
+ここまでが既定で手元の git だけで完結する。GitHub に問い合わせるのは `--with-remote` を付けたときか、`~/.storiff/config.json` に `{"with_remote": true}` と書いたときだけ。gh が入っていない、ログインしていない、ネットに出られない、GitHub ではない、といったときも取れた材料だけで動く。
+
 ## インストール
 Claude Code のプラグインとして入れる。marketplace を1回追加してからインストールする。
 
@@ -39,7 +49,7 @@ Claude Code のプラグインとして入れる。marketplace を1回追加し�
 セッションごとの生成物(changes.json や comments.json)は `~/.storiff/<日時>/` に置かれる。
 
 ## 設定ファイル
-`~/.storiff/config.json` に既定値を書ける。`host` と `exclude`(除外するファイルパターン)と `generated`(自動生成ファイルパターン)と `quiz`(理解度クイズを作るかどうか。既定は作らない)に対応。
+`~/.storiff/config.json` に既定値を書ける。`host` と `exclude`(除外するファイルパターン)と `generated`(自動生成ファイルパターン)と `quiz`(理解度クイズを作るかどうか。既定は作らない)と `with_remote`(GitHub の PR と課題も材料にするか。既定は false)に対応。
 
 ```json
 {"host": "0.0.0.0"}
