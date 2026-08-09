@@ -14,6 +14,9 @@ const SAME_CONTENT_LINE_COUNT_MAX = 100;
 // 単調増加列を計算する候補の総数がこれを超えたら、計算をやめて出現順に対応させる
 const MONOTONIC_CANDIDATE_COUNT_MAX = 5000000;
 
+// 1stepの図に置けるノード数の目安。これを超えると全体の構成図に近づくので check が参考に出す
+const DIAGRAM_NODE_COUNT_MAX = 8;
+
 // serve のデーモン起動を待つときのポーリング間隔と上限
 const SERVE_POLL_INTERVAL_MSEC = 200;
 const SERVE_START_TIMEOUT_MSEC = 10000;
@@ -610,6 +613,141 @@ function buildValidation(changeIds, files, steps) {
   }
   const ok = missing.length === 0 && duplicated.length === 0 && resolved.unknownFiles.length === 0;
   return { ok, missing, duplicated, unknown_files: resolved.unknownFiles, resolvedSteps: resolved.resolvedSteps };
+}
+
+// ステップの図を読み取る。ビューアにも同じ関数をそのまま埋め込むので、この関数の外を参照しない
+// 受け付けるのは flowchart の書き出しと、ノードの宣言と、矢印だけ。subgraph や style は読めない行になる
+function parseDiagram(source) {
+  const arrowRegexp = /\s*(-->|-\.->|==>)\s*(?:\|([^|]*)\|)?\s*/;
+  const nodeTokenRegexp = /^([A-Za-z_][A-Za-z0-9_]*)(?:\[([^\]]*)\]|\(([^)]*)\)|\{([^}]*)\})?$/;
+  const nodeMap = new Map();
+  const labeledNodeIds = new Set();
+  const edges = [];
+  const duplicatedNodeIds = [];
+  const duplicatedNodeLabels = [];
+  const oldSyntaxLines = [];
+  const unreadableLines = [];
+  let direction = "TD";
+  let hasHeader = false;
+
+  // ノードを覚える。ラベルが2回付いて中身が違うときは、片方が黙って消えるので重複として拾う
+  const touchNode = (token) => {
+    const matched = token.trim().match(nodeTokenRegexp);
+    if (!matched) return null;
+    const nodeId = matched[1];
+    let label = null;
+    let shape = "box";
+    if (matched[2] != null) label = matched[2];
+    if (matched[3] != null) {
+      label = matched[3];
+      shape = "round";
+    }
+    if (matched[4] != null) {
+      label = matched[4];
+      shape = "diamond";
+    }
+    if (!nodeMap.has(nodeId)) nodeMap.set(nodeId, { id: nodeId, label: nodeId, shape: "box" });
+    const node = nodeMap.get(nodeId);
+    if (label == null) return nodeId;
+    if (labeledNodeIds.has(nodeId) && node.label !== label) duplicatedNodeIds.push(nodeId);
+    labeledNodeIds.add(nodeId);
+    node.label = label;
+    node.shape = shape;
+    return nodeId;
+  };
+
+  for (const rawLine of String(source == null ? "" : source).split("\n")) {
+    const line = rawLine.trim().replace(/;$/, "");
+    if (line === "" || line.startsWith("%%")) continue;
+    if (!hasHeader) {
+      const headerMatch = line.match(/^(flowchart|graph)\s+(TD|TB|LR|RL|BT)$/);
+      if (!headerMatch) {
+        unreadableLines.push(line);
+        break;
+      }
+      hasHeader = true;
+      direction = headerMatch[2];
+      if (headerMatch[1] === "graph") oldSyntaxLines.push(line);
+      continue;
+    }
+    if (/-->>|--\)/.test(line)) {
+      oldSyntaxLines.push(line);
+      continue;
+    }
+    if (/->|=>|>>/.test(line.replace(/-->|-\.->|==>/g, " "))) {
+      oldSyntaxLines.push(line);
+      continue;
+    }
+    if (/^(subgraph|end|direction|classDef|class|style|click|linkStyle)\b/.test(line)) {
+      unreadableLines.push(line);
+      continue;
+    }
+    const parts = line.split(arrowRegexp);
+    if (parts.length % 3 !== 1) {
+      unreadableLines.push(line);
+      continue;
+    }
+    const lineNodeIds = [];
+    for (let index = 0; index < parts.length; index += 3) {
+      const nodeId = touchNode(parts[index]);
+      if (nodeId != null) lineNodeIds.push(nodeId);
+    }
+    if (lineNodeIds.length !== (parts.length + 2) / 3) {
+      unreadableLines.push(line);
+      continue;
+    }
+    for (let index = 0; index + 1 < lineNodeIds.length; index++) {
+      edges.push({ from: lineNodeIds[index], to: lineNodeIds[index + 1], label: parts[index * 3 + 2] || "" });
+    }
+  }
+
+  const nodeIdsByLabel = new Map();
+  for (const node of nodeMap.values()) {
+    if (!nodeIdsByLabel.has(node.label)) nodeIdsByLabel.set(node.label, []);
+    nodeIdsByLabel.get(node.label).push(node.id);
+  }
+  for (const [label, nodeIds] of nodeIdsByLabel) {
+    if (nodeIds.length > 1) duplicatedNodeLabels.push(label);
+  }
+
+  return {
+    direction,
+    nodes: [...nodeMap.values()],
+    edges,
+    duplicated_node_ids: duplicatedNodeIds,
+    duplicated_node_labels: duplicatedNodeLabels,
+    old_syntax_lines: oldSyntaxLines,
+    unreadable_lines: unreadableLines,
+  };
+}
+
+// 各stepの図を検算する。直すべきものは problems、ノード数が目安を超えるものは oversized に入れる
+function buildDiagramValidation(steps) {
+  const problems = [];
+  const oversized = [];
+  steps.forEach((step, index) => {
+    if (step.diagram == null || String(step.diagram).trim() === "") return;
+    const order = step.order != null ? step.order : index + 1;
+    const diagram = parseDiagram(step.diagram);
+    if (diagram.unreadable_lines.length > 0) {
+      const restCount = diagram.unreadable_lines.length - 1;
+      const restNote = restCount > 0 ? " ほか" + restCount + "行" : "";
+      problems.push("step" + order + " 読めない行 「" + diagram.unreadable_lines[0] + "」" + restNote);
+    }
+    if (diagram.old_syntax_lines.length > 0) {
+      problems.push("step" + order + " 古い書き方 「" + diagram.old_syntax_lines[0] + "」");
+    }
+    if (diagram.duplicated_node_ids.length > 0) {
+      problems.push("step" + order + " 同じノードIDに違うラベルが付いている " + diagram.duplicated_node_ids.join(", "));
+    }
+    if (diagram.duplicated_node_labels.length > 0) {
+      problems.push("step" + order + " 違うノードIDに同じラベルが付いている " + diagram.duplicated_node_labels.join(", "));
+    }
+    if (diagram.nodes.length > DIAGRAM_NODE_COUNT_MAX) {
+      oversized.push("step" + order + " " + (step.title || "") + " (" + diagram.nodes.length + "ノード)");
+    }
+  });
+  return { problems, oversized };
 }
 
 function buildStory(targetDir) {
@@ -1364,6 +1502,152 @@ function renderSplitCode(code, file, stepOrder, ownsSet, refsSet, visible){
     }
   }
 }
+// 図のノードの大きさと、段の間隔と、同じ段に並べるときの間隔
+var DIAGRAM_NODE_HEIGHT=36;
+var DIAGRAM_NODE_WIDTH_MIN=84;
+var DIAGRAM_LABEL_PADDING=18;
+var DIAGRAM_GAP_MAIN=68;
+var DIAGRAM_GAP_CROSS=16;
+var DIAGRAM_PADDING=14;
+var DIAGRAM_CORNER_RADIUS=6;
+// 矢印のラベルを線からどれだけ持ち上げるか
+var DIAGRAM_EDGE_LABEL_LIFT=6;
+// 菱形は上下がすぼまってラベルがはみ出るので、この倍率だけ横に広げる
+var DIAGRAM_DIAMOND_WIDTH_RATIO=1.5;
+// ラベルの幅を見積もるときの1文字あたりの幅。全角は半角のおよそ倍とみなす
+var DIAGRAM_CHAR_WIDTH_WIDE=13;
+var DIAGRAM_CHAR_WIDTH_NARROW=7.2;
+${parseDiagram}
+// ラベルの幅を見積もる
+function estimateDiagramLabelWidth(label){
+  var width=0;
+  for(var index=0;index<label.length;index++){
+    width+=label.charCodeAt(index)>255?DIAGRAM_CHAR_WIDTH_WIDE:DIAGRAM_CHAR_WIDTH_NARROW;
+  }
+  return width;
+}
+// ノードを段に分けて座標を決める。矢印がぐるっと回っていても段は node の数までしか増えない
+function placeDiagramNodes(diagram){
+  var nodeById={};
+  diagram.nodes.forEach(function(node){
+    var labelWidth=estimateDiagramLabelWidth(node.label);
+    if(node.shape==='diamond') labelWidth*=DIAGRAM_DIAMOND_WIDTH_RATIO;
+    node.width=Math.max(DIAGRAM_NODE_WIDTH_MIN, labelWidth+DIAGRAM_LABEL_PADDING*2);
+    node.layer=0;
+    nodeById[node.id]=node;
+  });
+  for(var round=0;round<diagram.nodes.length;round++){
+    var hasMoved=false;
+    diagram.edges.forEach(function(edge){
+      var from=nodeById[edge.from], to=nodeById[edge.to];
+      if(!from||!to||to.layer>=from.layer+1) return;
+      to.layer=from.layer+1;
+      hasMoved=true;
+    });
+    if(!hasMoved) break;
+  }
+  var layers=[];
+  diagram.nodes.forEach(function(node){
+    if(!layers[node.layer]) layers[node.layer]=[];
+    layers[node.layer].push(node);
+  });
+  var isHorizontal=diagram.direction==='LR'||diagram.direction==='RL';
+  var crossSizeByLayer=[];
+  var mainSize=0;
+  var crossSize=0;
+  layers.forEach(function(layerNodes, layerIndex){
+    var layerCrossSize=0;
+    if(isHorizontal){
+      var columnWidth=0;
+      layerNodes.forEach(function(node, position){
+        node.x=mainSize;
+        node.y=position*(DIAGRAM_NODE_HEIGHT+DIAGRAM_GAP_CROSS);
+        columnWidth=Math.max(columnWidth, node.width);
+      });
+      layerCrossSize=layerNodes.length*(DIAGRAM_NODE_HEIGHT+DIAGRAM_GAP_CROSS)-DIAGRAM_GAP_CROSS;
+      mainSize+=columnWidth+DIAGRAM_GAP_MAIN;
+    }else{
+      layerNodes.forEach(function(node){
+        node.x=layerCrossSize;
+        node.y=mainSize;
+        layerCrossSize+=node.width+DIAGRAM_GAP_CROSS;
+      });
+      layerCrossSize-=DIAGRAM_GAP_CROSS;
+      mainSize+=DIAGRAM_NODE_HEIGHT+DIAGRAM_GAP_MAIN;
+    }
+    crossSizeByLayer[layerIndex]=layerCrossSize;
+    crossSize=Math.max(crossSize, layerCrossSize);
+  });
+  layers.forEach(function(layerNodes, layerIndex){
+    var shift=(crossSize-crossSizeByLayer[layerIndex])/2;
+    layerNodes.forEach(function(node){
+      if(isHorizontal) node.y+=shift;
+      else node.x+=shift;
+    });
+  });
+  return {isHorizontal:isHorizontal, width:isHorizontal?mainSize-DIAGRAM_GAP_MAIN:crossSize, height:isHorizontal?crossSize:mainSize-DIAGRAM_GAP_MAIN};
+}
+// ノードの枠。丸みと菱形だけ形を変える
+function buildDiagramShape(node){
+  var centerX=node.x+node.width/2, centerY=node.y+DIAGRAM_NODE_HEIGHT/2;
+  if(node.shape==='diamond'){
+    var points=[centerX+' '+node.y, (node.x+node.width)+' '+centerY, centerX+' '+(node.y+DIAGRAM_NODE_HEIGHT), node.x+' '+centerY].join(', ');
+    return '<polygon class="dg-node" points="'+points+'"></polygon>';
+  }
+  var radius=node.shape==='round'?DIAGRAM_NODE_HEIGHT/2:DIAGRAM_CORNER_RADIUS;
+  return '<rect class="dg-node" x="'+node.x+'" y="'+node.y+'" width="'+node.width+'" height="'+DIAGRAM_NODE_HEIGHT+'" rx="'+radius+'"></rect>';
+}
+// 矢印1本。横向きなら右端から左端へ、縦向きなら下端から上端へつなぐ
+function buildDiagramEdge(from, to, label, isHorizontal){
+  var startX, startY, endX, endY, curve, labelX, labelY;
+  if(isHorizontal){
+    startX=from.x+from.width; startY=from.y+DIAGRAM_NODE_HEIGHT/2;
+    endX=to.x; endY=to.y+DIAGRAM_NODE_HEIGHT/2;
+    var middleX=(startX+endX)/2;
+    curve='M '+startX+' '+startY+' C '+middleX+' '+startY+', '+middleX+' '+endY+', '+endX+' '+endY;
+    labelX=middleX; labelY=(startY+endY)/2-DIAGRAM_EDGE_LABEL_LIFT;
+  }else{
+    startX=from.x+from.width/2; startY=from.y+DIAGRAM_NODE_HEIGHT;
+    endX=to.x+to.width/2; endY=to.y;
+    var middleY=(startY+endY)/2;
+    curve='M '+startX+' '+startY+' C '+startX+' '+middleY+', '+endX+' '+middleY+', '+endX+' '+endY;
+    labelX=(startX+endX)/2; labelY=middleY-DIAGRAM_EDGE_LABEL_LIFT;
+  }
+  var edgePath='<path class="dg-edge" d="'+curve+'" marker-end="url(#dgArrow)"></path>';
+  if(label==='') return edgePath;
+  return edgePath+'<text class="dg-edge-label" x="'+labelX+'" y="'+labelY+'" text-anchor="middle">'+esc(label)+'</text>';
+}
+// 読み取った図をSVGの文字列にする
+function buildDiagramSvg(diagram){
+  var box=placeDiagramNodes(diagram);
+  var nodeById={};
+  diagram.nodes.forEach(function(node){nodeById[node.id]=node;});
+  var body='<defs><marker id="dgArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path class="dg-arrow" d="M 0 0 L 10 5 L 0 10 z"></path></marker></defs>';
+  diagram.edges.forEach(function(edge){
+    var from=nodeById[edge.from], to=nodeById[edge.to];
+    if(from&&to) body+=buildDiagramEdge(from, to, edge.label, box.isHorizontal);
+  });
+  diagram.nodes.forEach(function(node){
+    body+=buildDiagramShape(node);
+    body+='<text class="dg-label" x="'+(node.x+node.width/2)+'" y="'+(node.y+DIAGRAM_NODE_HEIGHT/2)+'" text-anchor="middle" dominant-baseline="central">'+esc(node.label)+'</text>';
+  });
+  var width=box.width+DIAGRAM_PADDING*2, height=box.height+DIAGRAM_PADDING*2;
+  return '<svg class="dg-svg" width="'+width+'" height="'+height+'" viewBox="'+(-DIAGRAM_PADDING)+' '+(-DIAGRAM_PADDING)+' '+width+' '+height+'">'+body+'</svg>';
+}
+// そのステップの図を描く。読み取れない図は黙って隠し、差分の表示は続ける
+function renderDiagram(container, source){
+  container.style.display='none';
+  container.innerHTML='';
+  if(source==null||String(source).trim()==='') return;
+  try{
+    var diagram=parseDiagram(source);
+    if(diagram.nodes.length===0) return;
+    container.innerHTML=buildDiagramSvg(diagram);
+    container.style.display='block';
+  }catch(error){
+    container.innerHTML='';
+  }
+}
 var minimapBuiltSignature=null, mmStepById={};
 const MM_SCALE = 0.15;
 
@@ -1482,6 +1766,7 @@ function render(){
   document.getElementById('nextBtn').disabled=stepIndex>=story.steps.length-1;
   renderStepList();
   renderBanner();
+  renderDiagram(document.getElementById('diagram'), step?step.diagram:null);
   var diff=document.getElementById('diff');
   diff.innerHTML='';
   if(!step) return;
@@ -1598,9 +1883,9 @@ function minimapFingerprint(){
   var changePart=(story.change_ids||[]).length;
   return stepPart+'@'+changePart;
 }
-// ミニマップ用の指紋に題名・タイトル・説明文・refsの件数・コメントと返信の件数を加えた文字列。差分や追従、説明文の書き換えによる変化の検知に使う
+// ミニマップ用の指紋に題名・タイトル・説明文・図・refsの件数・コメントと返信の件数を加えた文字列。差分や追従、説明文の書き換えによる変化の検知に使う
 function storyFingerprint(minimapPart){
-  var stepPart=(story.steps||[]).map(function(step){return step.order+':'+step.title+':'+step.narration+':'+(step.refs||[]).length;}).join('|');
+  var stepPart=(story.steps||[]).map(function(step){return step.order+':'+step.title+':'+step.narration+':'+(step.diagram||'')+':'+(step.refs||[]).length;}).join('|');
   var comments=story.comments||[];
   var commentPart=comments.length+'#'+comments.map(function(comment){return (comment.replies||[]).length;}).join(',');
   return minimapPart+'@'+story.title+'@'+stepPart+'@'+commentPart;
@@ -1721,6 +2006,13 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 .content{padding:24px 32px 80px}
 .banner-box{background:#fff8e6;border:1px solid #f0d68a;color:#7a5b00;padding:12px 16px;border-radius:10px;margin-bottom:16px}
 .done-msg{background:#e6f6ec;border:1px solid #a3d9b1;color:#1a7f37;padding:12px 16px;border-radius:10px;margin-bottom:16px}
+.diagram{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:20px;padding:14px 16px;overflow-x:auto;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.dg-svg{display:block}
+.dg-node{fill:var(--surface-soft);stroke:var(--border);stroke-width:1}
+.dg-label{fill:var(--text-main);font-family:var(--code-font);font-size:12px}
+.dg-edge{fill:none;stroke:var(--text-soft);stroke-width:1.4}
+.dg-edge-label{fill:var(--text-soft);font-size:11px}
+.dg-arrow{fill:var(--text-soft)}
 .file{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:20px;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,.04)}
 .file-head{display:flex;align-items:center;gap:8px;padding:11px 16px;background:var(--surface-soft);border-bottom:1px solid var(--border-soft);position:sticky;top:0;z-index:10}
 .file-head .path{font-family:var(--code-font);font-size:13px;font-weight:600;word-break:break-all}
@@ -1831,6 +2123,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 <div class='content'>
 <div id='doneMsg' class='done-msg' style='display:none'>コメントを送信しました。AIの返信がまもなく各コメントの下に表示されます</div>
 <div id='banner'></div>
+<div id='diagram' class='diagram' style='display:none'></div>
 <div id='diff'></div>
 </div>
 </div>
@@ -1891,12 +2184,22 @@ function main() {
       }
       process.exit(1);
     }
+    const diagramValidation = buildDiagramValidation(validation.resolvedSteps);
+    if (diagramValidation.problems.length > 0) {
+      console.log("ng: 図の書き方を直す。使えるのは flowchart の書き出しと、名前[ラベル] の宣言と、A --> B の矢印だけ");
+      for (const problem of diagramValidation.problems) console.log("  " + problem);
+      process.exit(1);
+    }
     console.log("ok: 全 " + changes.change_ids.length + " 件の変更IDがちょうど1回ずつ owns に入っています");
     if (advisory.length > 0) {
       console.log("参考 目安 " + CHANGED_LINES_PER_STEP_GUIDE + "行を超えるstep(浅く広い機械的変更や自動生成物ならこのままでよい。密な実装なら分割を検討):");
       for (const step of advisory) {
         console.log("  step" + step.order + " " + step.title + " (" + step.lineCount + "行, " + step.fileCount + "ファイル)");
       }
+    }
+    if (diagramValidation.oversized.length > 0) {
+      console.log("参考 ノードが目安 " + DIAGRAM_NODE_COUNT_MAX + " 個を超える図(そのstepが触る呼び出し関係だけに絞る):");
+      for (const line of diagramValidation.oversized) console.log("  " + line);
     }
     return;
   }
@@ -2002,3 +2305,6 @@ module.exports.remapComments = remapComments;
 module.exports.runPrep = runPrep;
 module.exports.resolveSteps = resolveSteps;
 module.exports.buildValidation = buildValidation;
+module.exports.parseDiagram = parseDiagram;
+module.exports.buildDiagramValidation = buildDiagramValidation;
+module.exports.VIEWER_SCRIPT = VIEWER_SCRIPT;
