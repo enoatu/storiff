@@ -32,7 +32,7 @@ storiff は story(お話)と diff(変更点)を合わせた名前。いま変更
 | 状態が決まった順にうつる | 1つの関数の中で完結する変更 |
 | 呼ぶ側と呼ばれる側が別のファイルにある | テストの追加だけ |
 
-書けるのは Mermaid の flowchart の一部だけで、ノードは目安 8 個まで。check が書き方を検算する。
+書けるのは Mermaid の flowchart の一部だけで、ノードは目安8個まで。check が書き方を検算する。
 
 ## 進め方
 
@@ -41,7 +41,7 @@ storiff は story(お話)と diff(変更点)を合わせた名前。いま変更
    - prep は差分と一緒に、意図の材料を `<dir>/context.txt` に集める。手元の git だけで完結し、外には問い合わせない。GitHub の PR や課題も材料にしたいときだけ `--with-remote` を足す。ユーザーが望んでいないなら付けない
 3. ストーリーはサブエージェントに作らせる。メイン(この会話)に大量のコードを読み込ませないため、steps.json を作るところまでサブエージェント側で終わらせる
    - この会話で実装したなら、メインが「どんな順番で何のために作ったか」を短くまとめ、下の prompt に書いて渡す。サブエージェントはこの会話を見られない
-   - まだ実装していない変更なら、まとめは渡さず context.txt と files.txt と changes.txt から組み立てさせる
+   - まだ実装していない変更なら、まとめは渡さず context.txt と files.txt と changes.txt と hints.txt から組み立てさせる
    - 手順2の prep が「理解度クイズ: 有効」と出したときだけ、下の prompt の quiz の行を残す。出ていなければその行を消し、クイズは作らせない
    - Agent tool(subagent_type: general-purpose)で呼ぶ。メインはステップの数と check の結果だけ受け取り、コードの中身は読まない
 4. `node ~/.claude/skills/storiff/storiff.js serve <dir> --session-id "$CLAUDE_CODE_SESSION_ID"` を実行し、返ってきた URL を伝える。serve は tool のタイムアウトに縛られない常駐デーモンを立てて URL をすぐ返すので、裏で動かし続けなくてよい。同じ dir でもう一度実行すると起動済みのビューアにつなぎ直す。画面の「レビュー完了」で done.flag、「終了」で close.flag ができる

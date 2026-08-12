@@ -76,45 +76,55 @@ test("矢印をつなげて書いた1行から、矢印が2本できる", () => 
 test("空行と %% のコメント行は読み飛ばされる", () => {
   const diagram = parseDiagram("flowchart TD\n\n%% ここは説明\n  a --> b\n");
   assert.strictEqual(diagram.nodes.length, 2);
-  assert.deepStrictEqual(diagram.unreadable_lines, []);
+  assert.deepStrictEqual(diagram.unreadableLines, []);
 });
 
 test("同じノードIDに違うラベルを付けると重複として拾う", () => {
   const diagram = parseDiagram("flowchart TD\n  api[サーバ]\n  api[通信] --> db[保存先]");
-  assert.deepStrictEqual(diagram.duplicated_node_ids, ["api"]);
+  assert.deepStrictEqual(diagram.duplicatedNodeIds, ["api"]);
 });
 
 test("同じノードIDに同じラベルを付け直しても重複にはならない", () => {
   const diagram = parseDiagram("flowchart TD\n  api[サーバ] --> db[保存先]\n  api[サーバ] --> cache[控え]");
-  assert.deepStrictEqual(diagram.duplicated_node_ids, []);
+  assert.deepStrictEqual(diagram.duplicatedNodeIds, []);
 });
 
 test("違うノードIDに同じラベルを付けると重複として拾う", () => {
   const diagram = parseDiagram("flowchart TD\n  first[保存する] --> second[保存する]");
-  assert.deepStrictEqual(diagram.duplicated_node_labels, ["保存する"]);
+  assert.deepStrictEqual(diagram.duplicatedNodeLabels, ["保存する"]);
 });
 
 test("graph の書き出しが古い書き方として拾われる", () => {
   const diagram = parseDiagram("graph TD\n  a --> b");
-  assert.deepStrictEqual(diagram.old_syntax_lines, ["graph TD"]);
+  assert.deepStrictEqual(diagram.oldSyntaxLines, ["graph TD"]);
   assert.strictEqual(diagram.nodes.length, 2);
 });
 
 test("矢印を -> や -->> と書くと古い書き方として拾われる", () => {
-  assert.deepStrictEqual(parseDiagram("flowchart TD\n  a -> b").old_syntax_lines, ["a -> b"]);
-  assert.deepStrictEqual(parseDiagram("flowchart TD\n  a -->> b").old_syntax_lines, ["a -->> b"]);
+  assert.deepStrictEqual(parseDiagram("flowchart TD\n  a -> b").oldSyntaxLines, ["a -> b"]);
+  assert.deepStrictEqual(parseDiagram("flowchart TD\n  a -->> b").oldSyntaxLines, ["a -->> b"]);
+});
+
+test("ノードや矢印のラベルに入れた -> や => は古い書き方にしない", () => {
+  const nodeLabelDiagram = parseDiagram("flowchart LR\n  a[x -> y] --> b");
+  assert.deepStrictEqual(nodeLabelDiagram.oldSyntaxLines, []);
+  assert.deepStrictEqual(nodeLabelDiagram.nodes.map((node) => node.label), ["x -> y", "b"]);
+
+  const arrowLabelDiagram = parseDiagram("flowchart LR\n  a -->|map(x => y)| b");
+  assert.deepStrictEqual(arrowLabelDiagram.oldSyntaxLines, []);
+  assert.deepStrictEqual(arrowLabelDiagram.edges, [{ from: "a", to: "b", label: "map(x => y)" }]);
 });
 
 test("subgraph や style は読めない行になる", () => {
   const diagram = parseDiagram("flowchart TD\n  subgraph 内側\n  a[X]\n  end\n  style a fill:#fff");
-  assert.deepStrictEqual(diagram.unreadable_lines, ["subgraph 内側", "end", "style a fill:#fff"]);
+  assert.deepStrictEqual(diagram.unreadableLines, ["subgraph 内側", "end", "style a fill:#fff"]);
   assert.deepStrictEqual(diagram.nodes.map((node) => node.id), ["a"]);
 });
 
 test("flowchart 以外の書き出しは読み取らず、ノードが空になる", () => {
   const diagram = parseDiagram("sequenceDiagram\n  A->>B: こんにちは");
   assert.deepStrictEqual(diagram.nodes, []);
-  assert.deepStrictEqual(diagram.unreadable_lines, ["sequenceDiagram"]);
+  assert.deepStrictEqual(diagram.unreadableLines, ["sequenceDiagram"]);
 });
 
 test("diagram を持たないステップは検算の対象にならない", () => {
@@ -123,7 +133,7 @@ test("diagram を持たないステップは検算の対象にならない", () 
     { order: 2, title: "空文字", owns: [2], diagram: "  " },
   ]);
   assert.deepStrictEqual(validation.problems, []);
-  assert.deepStrictEqual(validation.oversized, []);
+  assert.deepStrictEqual(validation.oversizedDiagramSteps, []);
 });
 
 test("読めない行と古い書き方と重複が、まとめて problems に入る", () => {
@@ -138,12 +148,32 @@ test("読めない行と古い書き方と重複が、まとめて problems に�
   ]);
 });
 
-test("ノード数が目安を超える図は oversized に入り、problems には入らない", () => {
+test("書き出しの行しかない図は、ノードが1つも無いとして problems に入る", () => {
+  const validation = buildDiagramValidation([{ order: 1, title: "中身なし", diagram: "flowchart TD" }]);
+  assert.deepStrictEqual(validation.problems, ["step1 ノードが1つも無い。図を出さないなら diagram ごと消す"]);
+});
+
+test("読めない行のせいでノードが無い図は、読めない行だけを problems に入れる", () => {
+  const validation = buildDiagramValidation([{ order: 2, title: "別の図", diagram: "sequenceDiagram\n  A->>B: こんにちは" }]);
+  assert.deepStrictEqual(validation.problems, ["step2 読めない行 「sequenceDiagram」"]);
+});
+
+test("check は書き出しの行しかない図をngにする", (t) => {
+  const targetDir = makeTempDir("storiff-diagram-");
+  t.after(() => fs.rmSync(targetDir, { recursive: true, force: true }));
+
+  writeCheckTarget(targetDir, [{ order: 1, title: "タイトル", narration: "説明", owns: [1], refs: [], diagram: "flowchart TD" }]);
+  const result = runCheck(targetDir);
+  assert.strictEqual(result.exitCode, 1);
+  assert.match(result.stdout, /step1 ノードが1つも無い/);
+});
+
+test("ノード数が目安を超える図は oversizedDiagramSteps に入り、problems には入らない", () => {
   const nodeLines = [];
   for (let number = 1; number <= 10; number++) nodeLines.push("  n" + number + "[処理" + number + "]");
   const validation = buildDiagramValidation([{ order: 1, title: "大きい図", diagram: "flowchart TD\n" + nodeLines.join("\n") }]);
   assert.deepStrictEqual(validation.problems, []);
-  assert.deepStrictEqual(validation.oversized, ["step1 大きい図 (10ノード)"]);
+  assert.deepStrictEqual(validation.oversizedDiagramSteps, ["step1 大きい図 (10ノード)"]);
 });
 
 test("check は図が壊れているとng、直すとokになる", (t) => {
@@ -161,7 +191,7 @@ test("check は図が壊れているとng、直すとokになる", (t) => {
   assert.match(okResult.stdout, /^ok: /);
 });
 
-test("check は diagram が無くても今までどおりokになる", (t) => {
+test("check は diagram が無くても今まで通りokになる", (t) => {
   const targetDir = makeTempDir("storiff-diagram-");
   t.after(() => fs.rmSync(targetDir, { recursive: true, force: true }));
 
@@ -241,6 +271,31 @@ test("ビューアは diagram が無いステップで図の枠を出さない",
   viewer.renderDiagram(container, null);
   assert.strictEqual(container.style.display, "none");
   assert.strictEqual(container.innerHTML, "");
+});
+
+test("ビューアは図の描画で例外が出たらブラウザのコンソールに残す", () => {
+  const viewer = loadViewerDiagram();
+  let assignCount = 0;
+  const container = {
+    style: {},
+    set innerHTML(value) {
+      assignCount += 1;
+      if (assignCount === 2) throw new Error("描画に失敗しました");
+    },
+    get innerHTML() {
+      return "";
+    },
+  };
+  const originalConsoleError = console.error;
+  const shownErrors = [];
+  console.error = (error) => shownErrors.push(error);
+  try {
+    viewer.renderDiagram(container, "flowchart LR\n  a[X] --> b[Y]");
+  } finally {
+    console.error = originalConsoleError;
+  }
+  assert.strictEqual(shownErrors.length, 1);
+  assert.match(String(shownErrors[0].message), /描画に失敗しました/);
 });
 
 test("ビューアは読める図で図の枠を出す", () => {

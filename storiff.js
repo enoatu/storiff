@@ -17,6 +17,9 @@ const SAME_CONTENT_LINE_COUNT_MAX = 100;
 // 単調増加列を計算する候補の総数がこれを超えたら、計算をやめて出現順に対応させる
 const MONOTONIC_CANDIDATE_COUNT_MAX = 5000000;
 
+// 1stepの図に置けるノード数の目安。これを超えると全体の構成図に近づくので check が参考に出す
+const DIAGRAM_NODE_COUNT_MAX = 8;
+
 // 変更行がこの数を超えたら hints.txt の解析を省く
 const HINT_CHANGED_LINE_COUNT_MAX = 100000;
 
@@ -32,9 +35,6 @@ const HINT_NAME_LENGTH_MIN = 3;
 // 1つの名前について並べる使用箇所の数の上限
 const HINT_USE_COUNT_MAX = 20;
 
-// 1stepの図に置けるノード数の目安。これを超えると全体の構成図に近づくので check が参考に出す
-const DIAGRAM_NODE_COUNT_MAX = 8;
-
 // serve のデーモン起動を待つときのポーリング間隔と上限
 const SERVE_POLL_INTERVAL_MSEC = 200;
 const SERVE_START_TIMEOUT_MSEC = 10000;
@@ -44,9 +44,10 @@ function readJson(filePath, fallback) {
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
 }
 
+// 生成物にはコミット本文や PR 本文が入るので、書いた人だけが読める権限にする
 function writeFileAtomic(filePath, content) {
   const tempPath = filePath + ".tmp" + process.pid + "-" + Date.now();
-  fs.writeFileSync(tempPath, content);
+  fs.writeFileSync(tempPath, content, { mode: 0o600 });
   fs.renameSync(tempPath, filePath);
 }
 
@@ -174,65 +175,64 @@ function buildFilesMap(files) {
 }
 
 // 名前を定義している行の見つけ方。1つ目の丸括弧が定義された名前になる
-// 関数と型はどの深さでも拾い、変数と定数は行頭のものだけ拾う。中に入り込んだ作業用の変数は手がかりにならない
-const JAVASCRIPT_DEFINITION_PATTERNS = [
+// 関数とクラスと interface と enum はどの深さでも拾い、type と変数と定数は行頭のものだけ拾う
+// 中に入り込んだ作業用の変数は手がかりにならない
+const JAVASCRIPT_DEFINITION_REGEXPS = [
   /\b(?:function|class|interface|enum)\s+([A-Za-z_$][\w$]*)/g,
   /^(?:export\s+)?(?:const|let|var|type)\s+([A-Za-z_$][\w$]*)/g,
 ];
-const PYTHON_DEFINITION_PATTERNS = [
+const PYTHON_DEFINITION_REGEXPS = [
   /\b(?:def|class)\s+([A-Za-z_]\w*)/g,
   /^([A-Za-z_]\w*)\s*=(?!=)/g,
 ];
-const GO_DEFINITION_PATTERNS = [
+const GO_DEFINITION_REGEXPS = [
   /\bfunc\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)/g,
   /^(?:type|const|var)\s+([A-Za-z_]\w*)/g,
 ];
 
 // 拡張子ごとの定義の見つけ方。ここに無い言語は静かに飛ばす
-const DEFINITION_PATTERNS_BY_EXTENSION = {
-  ".js": JAVASCRIPT_DEFINITION_PATTERNS,
-  ".jsx": JAVASCRIPT_DEFINITION_PATTERNS,
-  ".mjs": JAVASCRIPT_DEFINITION_PATTERNS,
-  ".cjs": JAVASCRIPT_DEFINITION_PATTERNS,
-  ".ts": JAVASCRIPT_DEFINITION_PATTERNS,
-  ".tsx": JAVASCRIPT_DEFINITION_PATTERNS,
-  ".py": PYTHON_DEFINITION_PATTERNS,
-  ".go": GO_DEFINITION_PATTERNS,
+const DEFINITION_REGEXPS_BY_EXT = {
+  ".js": JAVASCRIPT_DEFINITION_REGEXPS,
+  ".jsx": JAVASCRIPT_DEFINITION_REGEXPS,
+  ".mjs": JAVASCRIPT_DEFINITION_REGEXPS,
+  ".cjs": JAVASCRIPT_DEFINITION_REGEXPS,
+  ".ts": JAVASCRIPT_DEFINITION_REGEXPS,
+  ".tsx": JAVASCRIPT_DEFINITION_REGEXPS,
+  ".py": PYTHON_DEFINITION_REGEXPS,
+  ".go": GO_DEFINITION_REGEXPS,
 };
 
 // 行の中で使われている名前を拾う
-const IDENTIFIER_PATTERN = /[A-Za-z_$][\w$]*/g;
+const IDENTIFIER_REGEXP = /[A-Za-z_$][\w$]*/g;
 
 // hints.txt の見出し。ヒントが参考でしかないことを、読む人にも AI にも先に伝える
-const HINTS_HEADER = [
+const HINT_HEADER = [
   "# 変更どうしのつながり(参考)",
   "# 名前の見た目だけで拾った手がかりなので外れも混ざる。ステップの境界は意図で決める",
   "",
 ].join("\n");
 
 // 拡張子から定義の見つけ方を選ぶ。対応していない言語は null
-function findDefinitionPatterns(filePath) {
+function findDefinitionRegexps(filePath) {
   if (filePath == null) return null;
-  const dotIndex = filePath.lastIndexOf(".");
-  if (dotIndex === -1) return null;
-  return DEFINITION_PATTERNS_BY_EXTENSION[filePath.slice(dotIndex)] || null;
+  return DEFINITION_REGEXPS_BY_EXT[path.extname(filePath)] || null;
 }
 
 // 変更行のうち名前を定義している行を、名前ごとにまとめる
 function collectDefinitions(files) {
-  const definitionsByName = new Map();
+  const definitionMap = new Map();
   for (const file of files) {
-    const definitionPatterns = findDefinitionPatterns(file.file);
-    if (definitionPatterns == null) continue;
+    const definitionRegexps = findDefinitionRegexps(file.file);
+    if (definitionRegexps == null) continue;
     for (const line of file.lines) {
       if (line.id == null) continue;
-      for (const pattern of definitionPatterns) {
-        for (const matched of line.text.matchAll(pattern)) {
+      for (const definitionRegexp of definitionRegexps) {
+        for (const matched of line.text.matchAll(definitionRegexp)) {
           const name = matched[1];
           if (name.length < HINT_NAME_LENGTH_MIN) continue;
-          const definition = definitionsByName.get(name);
+          const definition = definitionMap.get(name);
           if (definition == null) {
-            definitionsByName.set(name, { file: file.file, definitionIds: [line.id], useIds: [], useCount: 0, lastUseId: null });
+            definitionMap.set(name, { file: file.file, definitionIds: [line.id], useIds: [], useCount: 0, lastUseId: null });
             continue;
           }
           if (definition.definitionIds.length > HINT_DEFINITION_COUNT_MAX) continue;
@@ -241,17 +241,17 @@ function collectDefinitions(files) {
       }
     }
   }
-  return definitionsByName;
+  return definitionMap;
 }
 
 // 定義済みの名前が、定義した行とは別の変更行で使われている数を数える
-function countUses(files, definitionsByName) {
-  if (definitionsByName.size === 0) return;
+function collectUses(files, definitionMap) {
+  if (definitionMap.size === 0) return;
   for (const file of files) {
     for (const line of file.lines) {
       if (line.id == null) continue;
-      for (const matched of line.text.matchAll(IDENTIFIER_PATTERN)) {
-        const definition = definitionsByName.get(matched[0]);
+      for (const matched of line.text.matchAll(IDENTIFIER_REGEXP)) {
+        const definition = definitionMap.get(matched[0]);
         if (definition == null) continue;
         if (definition.lastUseId === line.id) continue;
         if (definition.definitionIds.includes(line.id)) continue;
@@ -272,13 +272,13 @@ function buildHintsText(files) {
       if (line.id != null) changedLineCount += 1;
     }
   }
-  if (changedLineCount > HINT_CHANGED_LINE_COUNT_MAX) return HINTS_HEADER + "変更行が多すぎるので解析を省きました\n";
+  if (changedLineCount > HINT_CHANGED_LINE_COUNT_MAX) return HINT_HEADER + "変更行が多すぎるので解析を省きました\n";
 
-  const definitionsByName = collectDefinitions(files);
-  countUses(files, definitionsByName);
+  const definitionMap = collectDefinitions(files);
+  collectUses(files, definitionMap);
   const hintLines = [];
   let skippedNameCount = 0;
-  for (const [name, definition] of definitionsByName) {
+  for (const [name, definition] of definitionMap) {
     if (definition.useCount === 0) continue;
     if (definition.definitionIds.length > HINT_DEFINITION_COUNT_MAX) continue;
     if (hintLines.length >= HINT_NAME_COUNT_MAX) {
@@ -291,17 +291,18 @@ function buildHintsText(files) {
     const useText = "変更ID " + definition.useIds.join(", ") + " が使っています";
     hintLines.push(definition.file + " の " + name + " を " + definitionText + "、" + useText + hiddenUseNote);
   }
-  if (hintLines.length === 0) return HINTS_HEADER + "手がかりは見つかりませんでした\n";
+  if (hintLines.length === 0) return HINT_HEADER + "手がかりは見つかりませんでした\n";
   if (skippedNameCount > 0) hintLines.push("ほか " + skippedNameCount + " 件の名前は省きました");
-  return HINTS_HEADER + hintLines.join("\n") + "\n";
+  return HINT_HEADER + hintLines.join("\n") + "\n";
 }
 
-// 解析に失敗しても prep 全体は止めず、失敗したことだけを書き残す
+// 解析に失敗しても prep 全体は止めず、失敗したことを prep の出力と hints.txt の両方に残す
 function buildHintsTextOrNote(files) {
   try {
     return buildHintsText(files);
   } catch (error) {
-    return HINTS_HEADER + "解析に失敗しました(" + String(error.message).split("\n")[0].trim() + ")\n";
+    console.log("手がかりの解析に失敗しました", error);
+    return HINT_HEADER + "解析に失敗しました(" + String(error.message).split("\n")[0].trim() + ")\n";
   }
 }
 
@@ -546,11 +547,24 @@ const CONTEXT_DOC_FILE_NAMES = ["CLAUDE.md", "AGENTS.md", "README.md"];
 // 課題番号らしき書き方。GitHub の #12 と JIRA 風の ABC-123
 const ISSUE_NUMBER_REGEXP = /#\d+|\b[A-Z][A-Z0-9]{1,9}-\d+\b/g;
 
-// 材料集めの外部コマンド。入っていない、失敗した、返事が無いときは null を返し、prep 全体は止めない
+// 課題番号と同じ形をした規格の名前。UTF-8 や SHA-256 を課題番号として拾わないために除く
+const STANDARD_NAMES = ["AES", "CVE", "GMT", "HTTP", "IPV", "ISO", "RFC", "RSA", "SHA", "UTC", "UTF"];
+
+// 一度出した失敗はもう出さない。同じコマンドを何度も呼んだときに同じ1行が並ばないようにする
+const shownCommandFailures = new Set();
+
+// 材料集めの外部コマンド。入っていないときは静かに飛ばし、実行して失敗したときは理由を1行だけ出す
 function runCommandOrNull(command, commandArgs, cwd) {
   try {
-    return execFileSync(command, commandArgs, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: CONTEXT_COMMAND_TIMEOUT_MSEC, maxBuffer: 1024 * 1024 * 8 });
-  } catch {
+    return execFileSync(command, commandArgs, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: CONTEXT_COMMAND_TIMEOUT_MSEC, maxBuffer: 1024 * 1024 * 8 });
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    const reason = (error.stderr ? error.stderr.toString() : String(error.message)).split("\n")[0].trim();
+    const failureMessage = "材料を集められません: " + command + " " + commandArgs[0] + " (" + reason + ")";
+    if (!shownCommandFailures.has(failureMessage)) {
+      shownCommandFailures.add(failureMessage);
+      console.log(failureMessage);
+    }
     return null;
   }
 }
@@ -564,8 +578,11 @@ function cutText(text, charMax) {
 
 // git diff の範囲指定から、その差分に含まれるコミットを読む git log の範囲を組み立てる
 // 範囲を指定していないときは作業中の変更なのでコミットが無く、null を返す
+// -- の後ろはファイルの絞り込みなので範囲には使わない
 function buildCommitRange(diffArgs) {
-  const revisions = diffArgs.filter((arg) => !arg.startsWith("-"));
+  const pathSeparatorIndex = diffArgs.indexOf("--");
+  const revisionArgs = pathSeparatorIndex === -1 ? diffArgs : diffArgs.slice(0, pathSeparatorIndex);
+  const revisions = revisionArgs.filter((arg) => !arg.startsWith("-"));
   if (revisions.length === 0) return null;
   if (revisions.length >= 2) return revisions[0] + ".." + revisions[1];
   if (revisions[0] === "HEAD") return null;
@@ -588,11 +605,16 @@ function collectCommits(repoPath, commitRange) {
   return commits;
 }
 
-// コミット1件を、件名と本文を字下げした形にする
 function formatCommit(commit) {
   const bodyLines = commit.body.split("\n").map((line) => line.trim()).filter((line) => line !== "").slice(0, CONTEXT_COMMIT_BODY_LINE_MAX);
   const heading = commit.hash + " " + commit.date + " " + commit.author;
   return [heading, "  " + commit.subject].concat(bodyLines.map((line) => "  " + line)).join("\n");
+}
+
+// ABC-123 の ABC にあたる部分が規格の名前なら、課題番号ではないとみなす
+function isStandardName(issueNumber) {
+  const namePart = issueNumber.split("-")[0];
+  return STANDARD_NAMES.includes(namePart.replace(/\d+$/, ""));
 }
 
 // コミットのメッセージとブランチ名から課題番号を拾う
@@ -600,6 +622,7 @@ function collectIssueNumbers(texts) {
   const issueNumbers = [];
   for (const text of texts) {
     for (const matched of String(text).match(ISSUE_NUMBER_REGEXP) || []) {
+      if (isStandardName(matched)) continue;
       if (!issueNumbers.includes(matched)) issueNumbers.push(matched);
     }
   }
@@ -607,7 +630,7 @@ function collectIssueNumbers(texts) {
 }
 
 // gh で GitHub を読む。gh が無い、ログインしていない、GitHub ではない、ネットに出られないときは null
-function fetchGithubJson(repoPath, ghArgs) {
+function fetchGithubJsonOrNull(repoPath, ghArgs) {
   const jsonText = runCommandOrNull("gh", ghArgs, repoPath);
   if (jsonText == null) return null;
   try {
@@ -617,66 +640,67 @@ function fetchGithubJson(repoPath, ghArgs) {
   }
 }
 
-// いまのブランチに対応する PR の説明とコメントを読む
-function fetchPullRequest(repoPath) {
-  return fetchGithubJson(repoPath, ["pr", "view", "--json", "number,title,url,body,comments,reviews"]);
+function fetchPullRequestOrNull(repoPath) {
+  return fetchGithubJsonOrNull(repoPath, ["pr", "view", "--json", "number,title,url,body,comments,reviews"]);
 }
 
-// 課題番号に対応する issue の説明とコメントを読む
-function fetchIssue(repoPath, issueNumber) {
-  return fetchGithubJson(repoPath, ["issue", "view", issueNumber.replace("#", ""), "--json", "number,title,url,body,comments"]);
+function fetchIssueOrNull(repoPath, issueNumber) {
+  return fetchGithubJsonOrNull(repoPath, ["issue", "view", issueNumber.replace("#", ""), "--json", "number,title,url,body,comments"]);
 }
 
-// PR や issue に付いたコメントを、書いた人ごとに並べる
-function formatRemarks(remarks) {
-  return remarks
-    .filter((remark) => remark != null && String(remark.body == null ? "" : remark.body).trim() !== "")
+function formatRemoteComments(comments) {
+  return comments
+    .filter((comment) => comment != null && String(comment.body == null ? "" : comment.body).trim() !== "")
     .slice(0, CONTEXT_REMOTE_COMMENT_COUNT_MAX)
-    .map((remark) => "--- " + (remark.author && remark.author.login ? remark.author.login : "不明") + " ---\n" + cutText(remark.body, CONTEXT_REMOTE_COMMENT_CHAR_MAX))
+    .map((comment) => "--- " + (comment.author && comment.author.login ? comment.author.login : "不明") + " ---\n" + cutText(comment.body, CONTEXT_REMOTE_COMMENT_CHAR_MAX))
     .join("\n");
 }
 
 // PR や issue を、番号と見出しとURLと本文とコメントの形にする
-function formatGithubItem(item) {
-  const remarks = (item.comments || []).concat(item.reviews || []);
-  const parts = ["#" + item.number + " " + item.title, item.url, cutText(item.body, CONTEXT_REMOTE_BODY_CHAR_MAX), formatRemarks(remarks)];
-  return parts.filter((part) => part != null && part !== "").join("\n");
+function formatGithubItem(pullRequestOrIssue) {
+  const comments = (pullRequestOrIssue.comments || []).concat(pullRequestOrIssue.reviews || []);
+  const blocks = ["#" + pullRequestOrIssue.number + " " + pullRequestOrIssue.title, pullRequestOrIssue.url, cutText(pullRequestOrIssue.body, CONTEXT_REMOTE_BODY_CHAR_MAX), formatRemoteComments(comments)];
+  return blocks.filter((block) => block != null && block !== "").join("\n");
 }
 
 // 1リポジトリ分の意図の材料を集める。取れなかった材料は静かに飛ばし、取れた分だけ返す
-function collectRepoContext(repo, repoPath, diffArgs, useRemote) {
+function collectRepoContext(specifiedRepoPath, repoPath, diffArgs, useRemoteContext) {
   const branchText = runCommandOrNull("git", ["rev-parse", "--abbrev-ref", "HEAD"], repoPath);
   const branchName = branchText == null ? "" : branchText.trim();
   const commits = collectCommits(repoPath, buildCommitRange(diffArgs));
   const issueNumbers = collectIssueNumbers([branchName].concat(commits.map((commit) => commit.subject + "\n" + commit.body)));
-  const pullRequest = useRemote ? fetchPullRequest(repoPath) : null;
+  const pullRequest = useRemoteContext ? fetchPullRequestOrNull(repoPath) : null;
   const issues = [];
-  if (useRemote) {
+  if (useRemoteContext) {
     const githubIssueNumbers = issueNumbers.filter((issueNumber) => issueNumber.startsWith("#")).slice(0, CONTEXT_REMOTE_ISSUE_COUNT_MAX);
     for (const githubIssueNumber of githubIssueNumbers) {
-      const issue = fetchIssue(repoPath, githubIssueNumber);
+      const issue = fetchIssueOrNull(repoPath, githubIssueNumber);
       if (issue != null) issues.push(issue);
     }
   }
-  return { repo, branchName, commits, issueNumbers, pullRequest, issues };
+  return { repo: specifiedRepoPath, branchName, commits, issueNumbers, pullRequest, issues };
 }
 
 // 変更したファイルから上のディレクトリへたどり、近くにある説明ファイルの場所を集める
+// 調べ終わったディレクトリは覚えておき、同じディレクトリを何度も調べない
 function collectDocPaths(files, repoPathMap) {
   const docPaths = [];
+  const checkedDirs = new Set();
   for (const file of files) {
     const repoPath = repoPathMap.get(file.repo);
     if (repoPath == null || !file.file) continue;
     const repoTag = file.repo && file.repo !== "." ? file.repo + " " : "";
     let currentDir = path.dirname(file.file);
-    while (true) {
+    while (docPaths.length < CONTEXT_DOC_PATH_COUNT_MAX) {
+      if (checkedDirs.has(repoTag + currentDir)) break;
+      checkedDirs.add(repoTag + currentDir);
       for (const docFileName of CONTEXT_DOC_FILE_NAMES) {
         const docPath = currentDir === "." ? docFileName : currentDir + "/" + docFileName;
-        if (docPaths.includes(repoTag + docPath)) continue;
         if (fs.existsSync(path.resolve(repoPath, docPath))) docPaths.push(repoTag + docPath);
       }
-      if (currentDir === ".") break;
-      currentDir = path.dirname(currentDir);
+      const parentDir = path.dirname(currentDir);
+      if (parentDir === currentDir) break;
+      currentDir = parentDir;
     }
   }
   return docPaths.slice(0, CONTEXT_DOC_PATH_COUNT_MAX);
@@ -708,7 +732,7 @@ function buildContextText(repoContexts, docPaths) {
   return cutText(blocks.join("\n\n"), CONTEXT_TOTAL_CHAR_MAX) + "\n";
 }
 
-function runPrep(targetDir, repoList, hasExplicitArgs, withRemote) {
+function runPrep(targetDir, repoList, hasExplicitArgs, useRemote) {
   cleanupStaleTempFiles(targetDir);
   const changesPath = path.join(targetDir, "changes.json");
   let previousChanges = null;
@@ -732,7 +756,7 @@ function runPrep(targetDir, repoList, hasExplicitArgs, withRemote) {
   const effectiveRepoList = usingRecordedRepoList ? previousChanges.repo_args : repoList;
   const cwd = usingRecordedRepoList ? previousChanges.cwd || process.cwd() : process.cwd();
   const config = loadConfig();
-  const useRemote = withRemote === true || config.with_remote === true || (hasPreviousChanges && previousChanges.with_remote === true);
+  const useRemoteContext = useRemote === true || config.with_remote === true;
   const collectedFiles = [];
   const diffTargets = [];
   const repoContexts = [];
@@ -752,7 +776,7 @@ function runPrep(targetDir, repoList, hasExplicitArgs, withRemote) {
     diffTargets.push(repo.path === "." ? range : repo.path + " " + range);
     if (diffText.trim() === "") continue;
     collectedFiles.push(...parseDiff(diffText, repo.path, 1).files);
-    repoContexts.push(collectRepoContext(repo.path, repoPath, diffArgs, useRemote));
+    repoContexts.push(collectRepoContext(repo.path, repoPath, diffArgs, useRemoteContext));
     repoPathMap.set(repo.path, repoPath);
   }
   const excludePatterns = NOISE_PATTERNS.concat(config.exclude || []);
@@ -788,7 +812,7 @@ function runPrep(targetDir, repoList, hasExplicitArgs, withRemote) {
     repos,
     repo_args: effectiveRepoList,
     cwd,
-    with_remote: useRemote,
+    with_remote: useRemoteContext,
     files,
     change_ids: changeIds,
   };
@@ -838,7 +862,7 @@ function runPrep(targetDir, repoList, hasExplicitArgs, withRemote) {
     isSameAsBefore = lostIds.length === 0 && newIds.length === 0 && isIdentityMap;
   }
 
-  fs.mkdirSync(targetDir, { recursive: true });
+  fs.mkdirSync(targetDir, { recursive: true, mode: 0o700 });
   if (isFollow && !isSameAsBefore) {
     writeFileAtomic(path.join(targetDir, "steps.prev.json"), JSON.stringify(previousSteps, null, 2));
     writeFileAtomic(path.join(targetDir, "comments.prev.json"), JSON.stringify(previousComments, null, 2));
@@ -848,12 +872,18 @@ function runPrep(targetDir, repoList, hasExplicitArgs, withRemote) {
   writeFileAtomic(filesMapPath, filesMapText);
   writeFileAtomic(hintsPath, hintsText);
   writeFileAtomic(contextPath, contextText);
-  console.log("生成: " + outputPath + " と " + textOutputPath + " と " + filesMapPath + " と " + hintsPath + " (変更ID " + changeIds.length + "件, ファイル " + files.length + "件, リポジトリ " + repos.length + "件" + excludedNote + ")");
+  console.log("生成: " + outputPath + " と " + textOutputPath + " と " + filesMapPath + " と " + hintsPath + " と " + contextPath + " (変更ID " + changeIds.length + "件, ファイル " + files.length + "件, リポジトリ " + repos.length + "件" + excludedNote + ")");
   if (contextText !== "") {
+    const branchCount = repoContexts.filter((repoContext) => repoContext.branchName !== "").length;
     const commitCount = repoContexts.reduce((total, repoContext) => total + repoContext.commits.length, 0);
     const remoteItemCount = repoContexts.reduce((total, repoContext) => total + (repoContext.pullRequest == null ? 0 : 1) + repoContext.issues.length, 0);
-    const remoteNote = useRemote ? ", PRと課題 " + remoteItemCount + "件" : "";
-    console.log("意図の材料: " + contextPath + " (コミット " + commitCount + "件, 説明ファイル " + docPaths.length + "件" + remoteNote + ")");
+    // 0件の材料まで並べると、中身が入っていても何も集まらなかったように読めるので、取れた材料だけ出す
+    const materialNotes = [];
+    if (branchCount > 0) materialNotes.push("ブランチ " + branchCount + "件");
+    if (commitCount > 0) materialNotes.push("コミット " + commitCount + "件");
+    if (docPaths.length > 0) materialNotes.push("説明ファイル " + docPaths.length + "件");
+    if (remoteItemCount > 0) materialNotes.push("PRと課題 " + remoteItemCount + "件");
+    console.log("意図の材料: " + contextPath + " (" + materialNotes.join(", ") + ")");
   }
   if (config.quiz) console.log("理解度クイズ: 有効。各ステップに quiz を1問つける");
   if (!isFollow) return;
@@ -1001,7 +1031,7 @@ function parseDiagram(source) {
   let hasHeader = false;
 
   // ノードを覚える。ラベルが2回付いて中身が違うときは、片方が黙って消えるので重複として拾う
-  const touchNode = (token) => {
+  const registerNode = (token) => {
     const matched = token.trim().match(nodeTokenRegexp);
     if (!matched) return null;
     const nodeId = matched[1];
@@ -1040,11 +1070,13 @@ function parseDiagram(source) {
       if (headerMatch[1] === "graph") oldSyntaxLines.push(line);
       continue;
     }
-    if (/-->>|--\)/.test(line)) {
+    // ラベルの中に -> や => が入っていても矢印ではないので、矢印の書き方を見る前に外す
+    const lineWithoutLabels = line.replace(/\[[^\]]*\]|\([^)]*\)|\{[^}]*\}|\|[^|]*\|/g, " ");
+    if (/-->>|--\)/.test(lineWithoutLabels)) {
       oldSyntaxLines.push(line);
       continue;
     }
-    if (/->|=>|>>/.test(line.replace(/-->|-\.->|==>/g, " "))) {
+    if (/->|=>|>>/.test(lineWithoutLabels.replace(/-->|-\.->|==>/g, " "))) {
       oldSyntaxLines.push(line);
       continue;
     }
@@ -1059,7 +1091,7 @@ function parseDiagram(source) {
     }
     const lineNodeIds = [];
     for (let index = 0; index < parts.length; index += 3) {
-      const nodeId = touchNode(parts[index]);
+      const nodeId = registerNode(parts[index]);
       if (nodeId != null) lineNodeIds.push(nodeId);
     }
     if (lineNodeIds.length !== (parts.length + 2) / 3) {
@@ -1071,12 +1103,12 @@ function parseDiagram(source) {
     }
   }
 
-  const nodeIdsByLabel = new Map();
+  const nodeIdsByLabelMap = new Map();
   for (const node of nodeMap.values()) {
-    if (!nodeIdsByLabel.has(node.label)) nodeIdsByLabel.set(node.label, []);
-    nodeIdsByLabel.get(node.label).push(node.id);
+    if (!nodeIdsByLabelMap.has(node.label)) nodeIdsByLabelMap.set(node.label, []);
+    nodeIdsByLabelMap.get(node.label).push(node.id);
   }
-  for (const [label, nodeIds] of nodeIdsByLabel) {
+  for (const [label, nodeIds] of nodeIdsByLabelMap) {
     if (nodeIds.length > 1) duplicatedNodeLabels.push(label);
   }
 
@@ -1084,40 +1116,44 @@ function parseDiagram(source) {
     direction,
     nodes: [...nodeMap.values()],
     edges,
-    duplicated_node_ids: duplicatedNodeIds,
-    duplicated_node_labels: duplicatedNodeLabels,
-    old_syntax_lines: oldSyntaxLines,
-    unreadable_lines: unreadableLines,
+    duplicatedNodeIds,
+    duplicatedNodeLabels,
+    oldSyntaxLines,
+    unreadableLines,
   };
 }
 
-// 各stepの図を検算する。直すべきものは problems、ノード数が目安を超えるものは oversized に入れる
+// 各stepの図を検算する。直すべきものは problems、ノード数が目安を超えるものは oversizedDiagramSteps に入れる
 function buildDiagramValidation(steps) {
   const problems = [];
-  const oversized = [];
+  const oversizedDiagramSteps = [];
   steps.forEach((step, index) => {
     if (step.diagram == null || String(step.diagram).trim() === "") return;
     const order = step.order != null ? step.order : index + 1;
     const diagram = parseDiagram(step.diagram);
-    if (diagram.unreadable_lines.length > 0) {
-      const restCount = diagram.unreadable_lines.length - 1;
+    if (diagram.unreadableLines.length > 0) {
+      const restCount = diagram.unreadableLines.length - 1;
       const restNote = restCount > 0 ? " ほか" + restCount + "行" : "";
-      problems.push("step" + order + " 読めない行 「" + diagram.unreadable_lines[0] + "」" + restNote);
+      problems.push("step" + order + " 読めない行 「" + diagram.unreadableLines[0] + "」" + restNote);
     }
-    if (diagram.old_syntax_lines.length > 0) {
-      problems.push("step" + order + " 古い書き方 「" + diagram.old_syntax_lines[0] + "」");
+    if (diagram.oldSyntaxLines.length > 0) {
+      problems.push("step" + order + " 古い書き方 「" + diagram.oldSyntaxLines[0] + "」");
     }
-    if (diagram.duplicated_node_ids.length > 0) {
-      problems.push("step" + order + " 同じノードIDに違うラベルが付いている " + diagram.duplicated_node_ids.join(", "));
+    if (diagram.duplicatedNodeIds.length > 0) {
+      problems.push("step" + order + " 同じノードIDに違うラベルが付いている " + diagram.duplicatedNodeIds.join(", "));
     }
-    if (diagram.duplicated_node_labels.length > 0) {
-      problems.push("step" + order + " 違うノードIDに同じラベルが付いている " + diagram.duplicated_node_labels.join(", "));
+    if (diagram.duplicatedNodeLabels.length > 0) {
+      problems.push("step" + order + " 違うノードIDに同じラベルが付いている " + diagram.duplicatedNodeLabels.join(", "));
+    }
+    // 書き出しの行しかない図は check を通ってもビューアが枠ごと隠すので、ここで気づけるようにする
+    if (diagram.nodes.length === 0 && diagram.unreadableLines.length === 0 && diagram.oldSyntaxLines.length === 0) {
+      problems.push("step" + order + " ノードが1つも無い。図を出さないなら diagram ごと消す");
     }
     if (diagram.nodes.length > DIAGRAM_NODE_COUNT_MAX) {
-      oversized.push("step" + order + " " + (step.title || "") + " (" + diagram.nodes.length + "ノード)");
+      oversizedDiagramSteps.push("step" + order + " " + (step.title || "") + " (" + diagram.nodes.length + "ノード)");
     }
   });
-  return { problems, oversized };
+  return { problems, oversizedDiagramSteps };
 }
 
 function buildStory(targetDir) {
@@ -2058,7 +2094,7 @@ var DIAGRAM_NODE_WIDTH_MIN=84;
 var DIAGRAM_LABEL_PADDING=18;
 var DIAGRAM_GAP_MAIN=68;
 var DIAGRAM_GAP_CROSS=16;
-var DIAGRAM_PADDING=14;
+var DIAGRAM_CANVAS_PADDING=14;
 var DIAGRAM_CORNER_RADIUS=6;
 // 矢印のラベルを線からどれだけ持ち上げるか
 var DIAGRAM_EDGE_LABEL_LIFT=6;
@@ -2068,7 +2104,7 @@ var DIAGRAM_DIAMOND_WIDTH_RATIO=1.5;
 var DIAGRAM_CHAR_WIDTH_WIDE=13;
 var DIAGRAM_CHAR_WIDTH_NARROW=7.2;
 ${parseDiagram}
-// ラベルの幅を見積もる
+// 描く前なので実際の幅を測れない。文字数から当てているだけなので、字体によってはずれる
 function estimateDiagramLabelWidth(label){
   var width=0;
   for(var index=0;index<label.length;index++){
@@ -2076,7 +2112,7 @@ function estimateDiagramLabelWidth(label){
   }
   return width;
 }
-// ノードを段に分けて座標を決める。矢印がぐるっと回っていても段は node の数までしか増えない
+// ノードを段に分けて座標を決める。矢印がぐるっと回っていても段はノードの数までしか増えない
 function placeDiagramNodes(diagram){
   var nodeById={};
   diagram.nodes.forEach(function(node){
@@ -2138,7 +2174,7 @@ function placeDiagramNodes(diagram){
   return {isHorizontal:isHorizontal, width:isHorizontal?mainSize-DIAGRAM_GAP_MAIN:crossSize, height:isHorizontal?crossSize:mainSize-DIAGRAM_GAP_MAIN};
 }
 // ノードの枠。丸みと菱形だけ形を変える
-function buildDiagramShape(node){
+function buildDiagramNode(node){
   var centerX=node.x+node.width/2, centerY=node.y+DIAGRAM_NODE_HEIGHT/2;
   if(node.shape==='diamond'){
     var points=[centerX+' '+node.y, (node.x+node.width)+' '+centerY, centerX+' '+(node.y+DIAGRAM_NODE_HEIGHT), node.x+' '+centerY].join(', ');
@@ -2167,24 +2203,23 @@ function buildDiagramEdge(from, to, label, isHorizontal){
   if(label==='') return edgePath;
   return edgePath+'<text class="dg-edge-label" x="'+labelX+'" y="'+labelY+'" text-anchor="middle">'+esc(label)+'</text>';
 }
-// 読み取った図をSVGの文字列にする
 function buildDiagramSvg(diagram){
-  var box=placeDiagramNodes(diagram);
+  var layout=placeDiagramNodes(diagram);
   var nodeById={};
   diagram.nodes.forEach(function(node){nodeById[node.id]=node;});
   var body='<defs><marker id="dgArrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path class="dg-arrow" d="M 0 0 L 10 5 L 0 10 z"></path></marker></defs>';
   diagram.edges.forEach(function(edge){
     var from=nodeById[edge.from], to=nodeById[edge.to];
-    if(from&&to) body+=buildDiagramEdge(from, to, edge.label, box.isHorizontal);
+    if(from&&to) body+=buildDiagramEdge(from, to, edge.label, layout.isHorizontal);
   });
   diagram.nodes.forEach(function(node){
-    body+=buildDiagramShape(node);
+    body+=buildDiagramNode(node);
     body+='<text class="dg-label" x="'+(node.x+node.width/2)+'" y="'+(node.y+DIAGRAM_NODE_HEIGHT/2)+'" text-anchor="middle" dominant-baseline="central">'+esc(node.label)+'</text>';
   });
-  var width=box.width+DIAGRAM_PADDING*2, height=box.height+DIAGRAM_PADDING*2;
-  return '<svg class="dg-svg" width="'+width+'" height="'+height+'" viewBox="'+(-DIAGRAM_PADDING)+' '+(-DIAGRAM_PADDING)+' '+width+' '+height+'">'+body+'</svg>';
+  var width=layout.width+DIAGRAM_CANVAS_PADDING*2, height=layout.height+DIAGRAM_CANVAS_PADDING*2;
+  return '<svg class="dg-svg" width="'+width+'" height="'+height+'" viewBox="'+(-DIAGRAM_CANVAS_PADDING)+' '+(-DIAGRAM_CANVAS_PADDING)+' '+width+' '+height+'">'+body+'</svg>';
 }
-// そのステップの図を描く。読み取れない図は黙って隠し、差分の表示は続ける
+// そのステップの図を描く。読み取れない図は隠して差分の表示は続け、失敗はブラウザのコンソールに出す
 function renderDiagram(container, source){
   container.style.display='none';
   container.innerHTML='';
@@ -2196,6 +2231,7 @@ function renderDiagram(container, source){
     container.style.display='block';
   }catch(error){
     container.innerHTML='';
+    console.error(error);
   }
 }
 var minimapBuiltSignature=null, mmStepById={};
@@ -2905,14 +2941,14 @@ function main() {
     const diagramNote = diagramStepCount > 0 ? "(図 " + diagramStepCount + "枚)" : "";
     console.log("ok: 全 " + changes.change_ids.length + " 件の変更IDがちょうど1回ずつ owns に入っています" + quizNote + diagramNote);
     if (advisory.length > 0) {
-      console.log("参考 目安 " + CHANGED_LINES_PER_STEP_GUIDE + "行を超えるstep(浅く広い機械的変更や自動生成物ならこのままでよい。密な実装なら分割を検討):");
+      console.log("参考 目安 " + CHANGED_LINES_PER_STEP_GUIDE + "行を超えるstep(浅く広い機械的変更や自動生成物ならこのままでよい。密な実装なら分割を検討)");
       for (const step of advisory) {
         console.log("  step" + step.order + " " + step.title + " (" + step.lineCount + "行, " + step.fileCount + "ファイル)");
       }
     }
-    if (diagramValidation.oversized.length > 0) {
-      console.log("参考 ノードが目安 " + DIAGRAM_NODE_COUNT_MAX + " 個を超える図(そのstepが触る呼び出し関係だけに絞る):");
-      for (const line of diagramValidation.oversized) console.log("  " + line);
+    if (diagramValidation.oversizedDiagramSteps.length > 0) {
+      console.log("参考 ノードが目安 " + DIAGRAM_NODE_COUNT_MAX + "個を超える図(そのstepが触る呼び出し関係だけに絞る)");
+      for (const line of diagramValidation.oversizedDiagramSteps) console.log("  " + line);
     }
     return;
   }
@@ -2936,7 +2972,7 @@ function main() {
     const globalDiffArgs = [];
     const repoList = [];
     let currentRepo = null;
-    const withRemote = args.slice(2).includes("--with-remote");
+    const useRemote = args.slice(2).includes("--with-remote");
     const rest = args.slice(2).filter((arg) => arg !== "--with-remote");
     for (let index = 0; index < rest.length; index++) {
       if (rest[index] === "--repo" && rest[index + 1]) {
@@ -2958,7 +2994,7 @@ function main() {
       }
     }
     try {
-      runPrep(targetDir, repoList, hasExplicitArgs, withRemote);
+      runPrep(targetDir, repoList, hasExplicitArgs, useRemote);
     } catch (error) {
       console.log("追従しません: steps.json か comments.json が壊れています(" + String(error.message).split("\n")[0].trim() + ")");
       process.exit(1);
@@ -3011,6 +3047,7 @@ if (require.main === module) main();
 module.exports.buildFileDiffText = buildFileDiffText;
 module.exports.buildAskPrompt = buildAskPrompt;
 module.exports.askHaiku = askHaiku;
+module.exports.findDefinitionRegexps = findDefinitionRegexps;
 module.exports.buildHintsText = buildHintsText;
 module.exports.buildHintsTextOrNote = buildHintsTextOrNote;
 module.exports.buildLineKeyIndex = buildLineKeyIndex;
@@ -3023,7 +3060,7 @@ module.exports.buildCommitRange = buildCommitRange;
 module.exports.collectIssueNumbers = collectIssueNumbers;
 module.exports.collectDocPaths = collectDocPaths;
 module.exports.buildContextText = buildContextText;
-module.exports.fetchPullRequest = fetchPullRequest;
+module.exports.fetchPullRequestOrNull = fetchPullRequestOrNull;
 module.exports.resolveSteps = resolveSteps;
 module.exports.buildValidation = buildValidation;
 module.exports.buildQuizIssues = buildQuizIssues;
