@@ -5,6 +5,9 @@ const path = require("path");
 const { execFileSync, spawn } = require("child_process");
 const os = require("os");
 
+// --backfill が欠落した変更IDを入れるステップの題。すでにあれば作り直さずそこに足す
+const BACKFILL_STEP_TITLE = "補足";
+
 // 1stepがおおよそ1時間の作業に収まる目安の変更行数。これを超えるstepは分割の候補
 const CHANGED_LINES_PER_STEP_GUIDE = 80;
 
@@ -993,6 +996,37 @@ function buildValidation(changeIds, files, steps) {
   }
   const ok = missing.length === 0 && duplicated.length === 0 && resolved.unknownFiles.length === 0;
   return { ok, missing, duplicated, unknown_files: resolved.unknownFiles, resolvedSteps: resolved.resolvedSteps };
+}
+
+// どのstepにも入っていない変更IDを、ファイルごとの1行にまとめる
+function buildUnassignedFileLines(files, missingIds) {
+  const missingIdSet = new Set(missingIds);
+  const fileLines = [];
+  files.forEach((file, index) => {
+    const ids = file.lines.filter((line) => line.id != null && missingIdSet.has(line.id)).map((line) => line.id);
+    if (ids.length > 0) fileLines.push("F" + (index + 1) + " " + file.file + " (id " + ids[0] + "-" + ids[ids.length - 1] + ")");
+  });
+  return fileLines;
+}
+
+// 欠落した変更IDを末尾の補足stepに入れ、steps.json に書き戻す。補足stepがすでにあればそこに足す
+function backfillMissingIds(targetDir, steps, missingIds) {
+  const stepList = steps.steps || [];
+  const backfillStep = stepList.find((step) => step.title === BACKFILL_STEP_TITLE);
+  if (backfillStep) {
+    backfillStep.owns = [...backfillStep.owns, ...foldIdsToRanges(missingIds)];
+  } else {
+    const maxOrder = stepList.reduce((largest, step) => Math.max(largest, step.order || 0), 0);
+    stepList.push({
+      order: maxOrder + 1,
+      title: BACKFILL_STEP_TITLE,
+      narration: "",
+      owns: foldIdsToRanges(missingIds),
+      refs: [],
+    });
+  }
+  steps.steps = stepList;
+  writeFileAtomic(path.join(targetDir, "steps.json"), JSON.stringify(steps, null, 2));
 }
 
 // 理解度クイズの作りを確かめる。quiz を持たないstepは対象外
@@ -2874,7 +2908,7 @@ function main() {
   const command = args[0];
   const targetDir = args[1];
   if (!command || !targetDir) {
-    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] | node storiff.js check <dir> | node storiff.js reply <dir> <コメント番号> <本文> | node storiff.js serve <dir> [--port N] [--host H]");
+    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] | node storiff.js check <dir> [--no-strict] [--backfill] | node storiff.js reply <dir> <コメント番号> <本文> | node storiff.js serve <dir> [--port N] [--host H]");
     process.exit(1);
   }
   if (command === "check") {
@@ -2884,18 +2918,21 @@ function main() {
       process.exit(1);
     }
     const steps = readJson(path.join(targetDir, "steps.json"), { steps: [] });
-    const validation = buildValidation(changes.change_ids, changes.files, steps.steps || []);
-    if (!validation.ok) {
+    const useBackfill = args.slice(2).includes("--backfill");
+    const allowsMissing = useBackfill || args.slice(2).includes("--no-strict");
+    let validation = buildValidation(changes.change_ids, changes.files, steps.steps || []);
+    if (useBackfill && validation.missing.length > 0) {
+      const backfilledCount = validation.missing.length;
+      backfillMissingIds(targetDir, steps, validation.missing);
+      validation = buildValidation(changes.change_ids, changes.files, steps.steps || []);
+      console.log("補足: 変更ID " + backfilledCount + " 件を「" + BACKFILL_STEP_TITLE + "」stepに入れて steps.json を書き戻しました");
+    }
+    const isNg = validation.duplicated.length > 0 || validation.unknown_files.length > 0 || (!allowsMissing && validation.missing.length > 0);
+    if (isNg) {
       console.log("ng:");
-      if (validation.missing.length > 0) {
-        const missingSet = new Set(validation.missing);
-        const unassignedFiles = [];
-        changes.files.forEach((file, index) => {
-          const ids = file.lines.filter((line) => line.id != null && missingSet.has(line.id)).map((line) => line.id);
-          if (ids.length > 0) unassignedFiles.push("F" + (index + 1) + " " + file.file + " (id " + ids[0] + "-" + ids[ids.length - 1] + ")");
-        });
+      if (!allowsMissing && validation.missing.length > 0) {
         console.log("  未割り当てのファイル(どこかのstepに足す):");
-        for (const line of unassignedFiles) console.log("    " + line);
+        for (const line of buildUnassignedFileLines(changes.files, validation.missing)) console.log("    " + line);
       }
       if (validation.duplicated.length > 0) console.log("  重複した変更ID " + validation.duplicated.length + "件: " + validation.duplicated.slice(0, 50).join(","));
       if (validation.unknown_files.length > 0) console.log("  不明なファイル: " + validation.unknown_files.join(", "));
@@ -2939,7 +2976,17 @@ function main() {
     const quizNote = quizStepCount > 0 ? "(理解度クイズ " + quizStepCount + "問)" : "";
     const diagramStepCount = (steps.steps || []).filter((step) => step.diagram != null && String(step.diagram).trim() !== "").length;
     const diagramNote = diagramStepCount > 0 ? "(図 " + diagramStepCount + "枚)" : "";
-    console.log("ok: 全 " + changes.change_ids.length + " 件の変更IDがちょうど1回ずつ owns に入っています" + quizNote + diagramNote);
+    if (allowsMissing) {
+      const placedCount = changes.change_ids.length - validation.missing.length;
+      const placedRate = changes.change_ids.length === 0 ? 100 : Math.round((placedCount / changes.change_ids.length) * 100);
+      console.log("ok: 全 " + changes.change_ids.length + " 件の変更IDのうち " + placedCount + " 件(" + placedRate + "%)が owns に入っています" + quizNote + diagramNote);
+    } else {
+      console.log("ok: 全 " + changes.change_ids.length + " 件の変更IDがちょうど1回ずつ owns に入っています" + quizNote + diagramNote);
+    }
+    if (allowsMissing && validation.missing.length > 0) {
+      console.log("参考 どのstepにも入っていない変更ID " + validation.missing.length + "件(欠落を許す指定なので ng にしません)");
+      for (const line of buildUnassignedFileLines(changes.files, validation.missing)) console.log("  " + line);
+    }
     if (advisory.length > 0) {
       console.log("参考 目安 " + CHANGED_LINES_PER_STEP_GUIDE + "行を超えるstep(浅く広い機械的変更や自動生成物ならこのままでよい。密な実装なら分割を検討)");
       for (const step of advisory) {
@@ -3063,6 +3110,8 @@ module.exports.buildContextText = buildContextText;
 module.exports.fetchPullRequestOrNull = fetchPullRequestOrNull;
 module.exports.resolveSteps = resolveSteps;
 module.exports.buildValidation = buildValidation;
+module.exports.buildUnassignedFileLines = buildUnassignedFileLines;
+module.exports.backfillMissingIds = backfillMissingIds;
 module.exports.buildQuizIssues = buildQuizIssues;
 module.exports.parseDiagram = parseDiagram;
 module.exports.buildDiagramValidation = buildDiagramValidation;
