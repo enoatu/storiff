@@ -14,6 +14,12 @@ const PLACED_ID_RATE_MIN = 0.5;
 // 1stepがおおよそ1時間の作業に収まる目安の変更行数。これを超えるstepは分割の候補
 const CHANGED_LINES_PER_STEP_GUIDE = 80;
 
+// 区切りの下書きで、隣とまとめてよい差分のかたまりの変更行数。これを超えるかたまりは単独で1stepにする
+const DRAFT_HUNK_LINES_MAX = 10;
+
+// 区切りの下書きの仮の題の長さ。かたまりの見出しがそのまま長い1行のこともあるので切る
+const DRAFT_TITLE_LENGTH_MAX = 40;
+
 // 理解度クイズの選択肢の最小数。これより少ないと当てずっぽうでも通ってしまう
 const QUIZ_CHOICE_COUNT_MIN = 3;
 
@@ -87,7 +93,7 @@ function parseDiff(diffText, repo, startId) {
       if (bIndex !== -1) {
         fallbackFile = rawLine.slice(bIndex + 3);
       }
-      currentFile = { repo, file: fallbackFile, status: "modified", lines: [] };
+      currentFile = { repo, file: fallbackFile, status: "modified", hunks: [], lines: [] };
       files.push(currentFile);
       continue;
     }
@@ -125,10 +131,11 @@ function parseDiff(diffText, repo, startId) {
       continue;
     }
     if (rawLine.startsWith("@@")) {
-      const matched = rawLine.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      const matched = rawLine.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@ ?(.*)$/);
       if (matched) {
         oldLine = parseInt(matched[1], 10);
         newLine = parseInt(matched[2], 10);
+        currentFile.hunks.push({ heading: matched[3].trim() });
       }
       continue;
     }
@@ -136,18 +143,19 @@ function parseDiff(diffText, repo, startId) {
 
     const marker = rawLine[0];
     const text = rawLine.slice(1);
+    const hunk = currentFile.hunks.length - 1;
     if (marker === " ") {
-      currentFile.lines.push({ kind: "context", old: oldLine, new: newLine, text });
+      currentFile.lines.push({ kind: "context", old: oldLine, new: newLine, text, hunk });
       oldLine += 1;
       newLine += 1;
     } else if (marker === "+") {
       const id = nextId++;
-      currentFile.lines.push({ kind: "add", old: null, new: newLine, text, id });
+      currentFile.lines.push({ kind: "add", old: null, new: newLine, text, id, hunk });
       changeIds.push(id);
       newLine += 1;
     } else if (marker === "-") {
       const id = nextId++;
-      currentFile.lines.push({ kind: "del", old: oldLine, new: null, text, id });
+      currentFile.lines.push({ kind: "del", old: oldLine, new: null, text, id, hunk });
       changeIds.push(id);
       oldLine += 1;
     }
@@ -738,7 +746,59 @@ function buildContextText(repoContexts, docPaths) {
   return cutText(blocks.join("\n\n"), CONTEXT_TOTAL_CHAR_MAX) + "\n";
 }
 
-function runPrep(targetDir, repoList, hasExplicitArgs, useRemote) {
+// 差分のかたまりを1つずつ拾い、そのかたまりが持つ変更IDと仮の題を組にする
+function collectHunkChunks(files) {
+  const chunks = [];
+  for (const file of files) {
+    const idsByHunk = new Map();
+    for (const line of file.lines) {
+      if (line.id == null) continue;
+      const ids = idsByHunk.get(line.hunk) || [];
+      ids.push(line.id);
+      idsByHunk.set(line.hunk, ids);
+    }
+    for (const [hunkIndex, ids] of idsByHunk) {
+      const hunk = (file.hunks || [])[hunkIndex];
+      const heading = hunk == null ? "" : hunk.heading.slice(0, DRAFT_TITLE_LENGTH_MAX);
+      chunks.push({ file, title: heading !== "" ? heading : path.basename(file.file), ids });
+    }
+  }
+  return chunks;
+}
+
+// 差分のかたまりからステップの区切りの下書きを作る。1かたまり1stepを基本に、小さいものはまとめ、大きいものは割る
+// ファイルをまたいでまとめると読み手が追えなくなるので、まとめるのは同じファイルの中だけにする
+function buildDraftSteps(files) {
+  const groups = [];
+  for (const chunk of collectHunkChunks(files)) {
+    const isSmall = chunk.ids.length <= DRAFT_HUNK_LINES_MAX;
+    const previous = groups[groups.length - 1];
+    const canMerge = previous != null && previous.file === chunk.file && previous.isSmall && isSmall
+      && previous.ids.length + chunk.ids.length <= CHANGED_LINES_PER_STEP_GUIDE;
+    if (canMerge) {
+      previous.ids = previous.ids.concat(chunk.ids);
+      continue;
+    }
+    groups.push({ file: chunk.file, title: chunk.title, ids: chunk.ids, isSmall });
+  }
+  const steps = [];
+  for (const group of groups) {
+    const partCount = Math.ceil(group.ids.length / CHANGED_LINES_PER_STEP_GUIDE);
+    const partSize = Math.ceil(group.ids.length / partCount);
+    for (let start = 0; start < group.ids.length; start += partSize) {
+      steps.push({
+        order: steps.length + 1,
+        title: start === 0 ? group.title : group.title + " の続き",
+        narration: "",
+        owns: foldIdsToRanges(group.ids.slice(start, start + partSize)),
+        refs: [],
+      });
+    }
+  }
+  return steps;
+}
+
+function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
   cleanupStaleTempFiles(targetDir);
   const changesPath = path.join(targetDir, "changes.json");
   let previousChanges = null;
@@ -892,6 +952,12 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote) {
     console.log("意図の材料: " + contextPath + " (" + materialNotes.join(", ") + ")");
   }
   if (config.quiz) console.log("理解度クイズ: 有効。各ステップに quiz を1問つける");
+  if (useDraft === true && previousSteps == null) {
+    const draftSteps = buildDraftSteps(files);
+    const draftPath = path.join(targetDir, "steps.json");
+    writeFileAtomic(draftPath, JSON.stringify({ title: "", steps: draftSteps }, null, 2));
+    console.log("区切りの下書き: " + draftPath + " (ステップ " + draftSteps.length + "件)。題と説明は空なので後から書く");
+  }
   if (!isFollow) return;
   if (!isSameAsBefore) {
     writeFileAtomic(path.join(targetDir, "steps.json"), JSON.stringify(Object.assign({}, previousSteps, { steps: remappedSteps }), null, 2));
@@ -2972,7 +3038,7 @@ function main() {
   const command = args[0];
   const targetDir = args[1];
   if (!command || !targetDir) {
-    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] | node storiff.js check <dir> [--strict] | node storiff.js reply <dir> <コメント番号> <本文> | node storiff.js serve <dir> [--port N] [--host H]");
+    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] [--with-draft] | node storiff.js check <dir> [--strict] | node storiff.js reply <dir> <コメント番号> <本文> | node storiff.js serve <dir> [--port N] [--host H]");
     process.exit(1);
   }
   if (command === "check") {
@@ -3090,7 +3156,8 @@ function main() {
     const repoList = [];
     let currentRepo = null;
     const useRemote = args.slice(2).includes("--with-remote");
-    const rest = args.slice(2).filter((arg) => arg !== "--with-remote");
+    const useDraft = args.slice(2).includes("--with-draft");
+    const rest = args.slice(2).filter((arg) => arg !== "--with-remote" && arg !== "--with-draft");
     for (let index = 0; index < rest.length; index++) {
       if (rest[index] === "--repo" && rest[index + 1]) {
         currentRepo = { path: rest[index + 1], diffArgs: [] };
@@ -3111,7 +3178,7 @@ function main() {
       }
     }
     try {
-      runPrep(targetDir, repoList, hasExplicitArgs, useRemote);
+      runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft);
     } catch (error) {
       console.log("追従しません: steps.json か comments.json が壊れています(" + String(error.message).split("\n")[0].trim() + ")");
       process.exit(1);
@@ -3173,6 +3240,8 @@ module.exports.foldIdsToRanges = foldIdsToRanges;
 module.exports.remapSteps = remapSteps;
 module.exports.remapComments = remapComments;
 module.exports.runPrep = runPrep;
+module.exports.parseDiff = parseDiff;
+module.exports.buildDraftSteps = buildDraftSteps;
 module.exports.buildCommitRange = buildCommitRange;
 module.exports.collectIssueNumbers = collectIssueNumbers;
 module.exports.collectDocPaths = collectDocPaths;
