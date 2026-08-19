@@ -962,7 +962,7 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
     const draftSteps = buildDraftSteps(files);
     const draftPath = path.join(targetDir, "steps.json");
     writeFileAtomic(draftPath, JSON.stringify({ title: "", steps: draftSteps }, null, 2));
-    console.log("区切りの下書き: " + draftPath + " (ステップ " + draftSteps.length + "件)。題と説明は空なので後から書く");
+    console.log("区切りの下書き: " + draftPath + " (ステップ " + draftSteps.length + "件)。題は仮のままでよく、説明は fill が埋める");
   }
   if (!isFollow) return;
   if (!isSameAsBefore) {
@@ -1736,6 +1736,10 @@ var QUIZ_CHOICE_COUNT_MIN=3;
 var QUIZ_WRONG_COUNT_TO_REVEAL=2;
 // ステップ番号ごとの理解度クイズの回答ぐあい。再描画しても消さない
 var quizStateByOrder={};
+// 説明文がまだ書かれていないステップに出す文言。fill が書き終えると入れ替わる
+var NARRATION_PENDING_TEXT='説明文をいま書いています。書けたコマから自動で出ます';
+// 説明文待ちのステップに、左の一覧で添える文字
+var STEP_PENDING_LABEL='準備中';
 
 function esc(text){var div=document.createElement('div');div.textContent=text==null?'':String(text);return div.innerHTML;}
 // 先にHTMLエスケープしてから \`code\` と **強調** を効かせる
@@ -1775,6 +1779,8 @@ function renderMarkdown(container, text){
 }
 function commentKey(file, changeId){return file + '#' + changeId;}
 function stepNumber(step, index){return step.order!=null?step.order:index+1;}
+// fill がまだ説明文を書いていないステップかどうか
+function isNarrationPending(step){return step!=null&&String(step.narration||'').trim()==='';}
 function indexComments(){
   commentsByKey={};
   lostCommentsByStep={};
@@ -1807,6 +1813,12 @@ function renderStepList(){
     titleLabel.textContent=step.title;
     item.appendChild(numberLabel);
     item.appendChild(titleLabel);
+    if(isNarrationPending(step)){
+      var pendingLabel=document.createElement('span');
+      pendingLabel.className='step-pending';
+      pendingLabel.textContent=STEP_PENDING_LABEL;
+      item.appendChild(pendingLabel);
+    }
     item.onclick=function(){goToStep(index);};
     list.appendChild(item);
   });
@@ -2704,7 +2716,10 @@ function render(){
   var step=story.steps[stepIndex];
   document.getElementById('storyTitle').textContent=story.title||'storiff';
   document.getElementById('stepTitle').textContent=step?step.title:'ステップがありません';
-  renderMarkdown(document.getElementById('narration'), step?step.narration:'');
+  var narrationBox=document.getElementById('narration');
+  var isPending=isNarrationPending(step);
+  narrationBox.className=isPending?'narration pending':'narration';
+  renderMarkdown(narrationBox, isPending?NARRATION_PENDING_TEXT:(step?step.narration:''));
   document.getElementById('counter').textContent='Step '+(step?stepNumber(step, stepIndex):0)+' / '+story.steps.length;
   document.getElementById('prevBtn').disabled=stepIndex<=0;
   document.getElementById('nextBtn').disabled=!canGoNext();
@@ -2921,6 +2936,7 @@ body{
 }
 .step-item.active .step-num{background:var(--accent);color:#fff}
 .step-item-title{flex:1;padding-top:1px;word-break:break-word}
+.step-pending{flex:none;padding-top:2px;font-size:11px;font-weight:400;color:var(--text-soft);white-space:nowrap}
 .main{margin-left:var(--sidebar-width);margin-right:var(--minimap-width)}
 .minimap{position:fixed;top:0;right:0;width:var(--minimap-width);height:100vh;background:var(--surface);border-left:1px solid var(--border);overflow:hidden;z-index:25;cursor:pointer}
 .minimap-inner{position:relative;height:100%;width:100%}
@@ -2954,6 +2970,7 @@ button:disabled{opacity:.4;cursor:default}
 .step-heading{font-size:20px;font-weight:700;margin:6px 0 8px;line-height:1.4;max-width:820px}
 .narration{font-size:14px;line-height:1.7;margin:0;color:var(--text-main);max-width:820px}
 .narration .md-line+.md-line{margin-top:2px}
+.narration.pending{color:var(--text-soft)}
 .md-list{margin:4px 0;padding-left:22px}
 .md-list li{margin:2px 0}
 code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft);border:1px solid var(--border-soft);border-radius:5px;padding:1px 5px}
