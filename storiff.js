@@ -5,8 +5,11 @@ const path = require("path");
 const { execFileSync, spawn } = require("child_process");
 const os = require("os");
 
-// --backfill が欠落した変更IDを入れるステップの題。すでにあれば作り直さずそこに足す
+// check がどのステップにも入らなかった変更IDを入れるステップの題。すでにあれば作り直さずそこに足す
 const BACKFILL_STEP_TITLE = "補足";
+
+// ステップの owns が覆っていないといけない変更IDの割合。これを下回るとストーリーとして成立していないので ng
+const PLACED_ID_RATE_MIN = 0.5;
 
 // 1stepがおおよそ1時間の作業に収まる目安の変更行数。これを超えるstepは分割の候補
 const CHANGED_LINES_PER_STEP_GUIDE = 80;
@@ -2969,7 +2972,7 @@ function main() {
   const command = args[0];
   const targetDir = args[1];
   if (!command || !targetDir) {
-    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] | node storiff.js check <dir> [--no-strict] [--backfill] | node storiff.js reply <dir> <コメント番号> <本文> | node storiff.js serve <dir> [--port N] [--host H]");
+    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] | node storiff.js check <dir> [--strict] | node storiff.js reply <dir> <コメント番号> <本文> | node storiff.js serve <dir> [--port N] [--host H]");
     process.exit(1);
   }
   if (command === "check") {
@@ -2979,25 +2982,32 @@ function main() {
       process.exit(1);
     }
     const steps = readJson(path.join(targetDir, "steps.json"), { steps: [] });
-    const useBackfill = args.slice(2).includes("--backfill");
-    const allowsMissing = useBackfill || args.slice(2).includes("--no-strict");
+    const isStrict = args.slice(2).includes("--strict");
     let validation = buildValidation(changes.change_ids, changes.files, steps.steps || []);
-    if (useBackfill && validation.missing.length > 0) {
-      const backfilledCount = validation.missing.length;
-      backfillMissingIds(targetDir, steps, validation.missing);
-      validation = buildValidation(changes.change_ids, changes.files, steps.steps || []);
-      console.log("補足: 変更ID " + backfilledCount + " 件を「" + BACKFILL_STEP_TITLE + "」stepに入れて steps.json を書き戻しました");
-    }
-    const isNg = validation.duplicated.length > 0 || validation.unknown_files.length > 0 || (!allowsMissing && validation.missing.length > 0);
+    const missingIds = validation.missing;
+    const placedCount = changes.change_ids.length - missingIds.length;
+    const placedRate = changes.change_ids.length === 0 ? 1 : placedCount / changes.change_ids.length;
+    const placedPercent = Math.round(placedRate * 100);
+    const isBelowPlacedFloor = missingIds.length > 0 && placedRate < PLACED_ID_RATE_MIN;
+    const isNg = validation.duplicated.length > 0 || validation.unknown_files.length > 0 || isBelowPlacedFloor || (isStrict && missingIds.length > 0);
     if (isNg) {
       console.log("ng:");
-      if (!allowsMissing && validation.missing.length > 0) {
+      if (isBelowPlacedFloor) {
+        console.log("  owns が覆えたのは全 " + changes.change_ids.length + " 件の変更IDのうち " + placedCount + " 件(" + placedPercent + "%)しかなく、目安の " + Math.round(PLACED_ID_RATE_MIN * 100) + "% を下回るのでストーリーとして成立していません");
+      }
+      if (isBelowPlacedFloor || (isStrict && missingIds.length > 0)) {
         console.log("  未割り当てのファイル(どこかのstepに足す):");
-        for (const line of buildUnassignedFileLines(changes.files, validation.missing)) console.log("    " + line);
+        for (const line of buildUnassignedFileLines(changes.files, missingIds)) console.log("    " + line);
       }
       if (validation.duplicated.length > 0) console.log("  重複した変更ID " + validation.duplicated.length + "件: " + validation.duplicated.slice(0, 50).join(","));
       if (validation.unknown_files.length > 0) console.log("  不明なファイル: " + validation.unknown_files.join(", "));
       process.exit(1);
+    }
+    if (missingIds.length > 0) {
+      console.log("補足: どのstepにも入らなかった変更ID " + missingIds.length + " 件を「" + BACKFILL_STEP_TITLE + "」stepに入れて steps.json を書き戻しました");
+      for (const line of buildUnassignedFileLines(changes.files, missingIds)) console.log("  " + line);
+      backfillMissingIds(targetDir, steps, missingIds);
+      validation = buildValidation(changes.change_ids, changes.files, steps.steps || []);
     }
     const quizIssues = buildQuizIssues(steps.steps || []);
     if (quizIssues.length > 0) {
@@ -3037,16 +3047,10 @@ function main() {
     const quizNote = quizStepCount > 0 ? "(理解度クイズ " + quizStepCount + "問)" : "";
     const diagramStepCount = (steps.steps || []).filter((step) => step.diagram != null && String(step.diagram).trim() !== "").length;
     const diagramNote = diagramStepCount > 0 ? "(図 " + diagramStepCount + "枚)" : "";
-    if (allowsMissing) {
-      const placedCount = changes.change_ids.length - validation.missing.length;
-      const placedRate = changes.change_ids.length === 0 ? 100 : Math.round((placedCount / changes.change_ids.length) * 100);
-      console.log("ok: 全 " + changes.change_ids.length + " 件の変更IDのうち " + placedCount + " 件(" + placedRate + "%)が owns に入っています" + quizNote + diagramNote);
-    } else {
+    if (isStrict) {
       console.log("ok: 全 " + changes.change_ids.length + " 件の変更IDがちょうど1回ずつ owns に入っています" + quizNote + diagramNote);
-    }
-    if (allowsMissing && validation.missing.length > 0) {
-      console.log("参考 どのstepにも入っていない変更ID " + validation.missing.length + "件(欠落を許す指定なので ng にしません)");
-      for (const line of buildUnassignedFileLines(changes.files, validation.missing)) console.log("  " + line);
+    } else {
+      console.log("ok: 全 " + changes.change_ids.length + " 件の変更IDのうち " + placedCount + " 件(" + placedPercent + "%)をstepの owns が覆っています" + quizNote + diagramNote);
     }
     if (advisory.length > 0) {
       console.log("参考 目安 " + CHANGED_LINES_PER_STEP_GUIDE + "行を超えるstep(浅く広い機械的変更や自動生成物ならこのままでよい。密な実装なら分割を検討)");
