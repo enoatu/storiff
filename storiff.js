@@ -1029,6 +1029,22 @@ function backfillMissingIds(targetDir, steps, missingIds) {
   writeFileAtomic(path.join(targetDir, "steps.json"), JSON.stringify(steps, null, 2));
 }
 
+// 中身のある箇条書きの件数。空文字だけの要素は数えない
+function countFilledItems(values) {
+  return (Array.isArray(values) ? values : []).filter((value) => String(value).trim() !== "").length;
+}
+
+// ストーリーの全体像の作りを確かめる。文章の良し悪しは機械では決められないので ng にはせず参考として返す
+// 全体像を持たないストーリーは今まで通りなので、何も言わない
+function buildOverviewIssues(overview) {
+  if (overview == null) return [];
+  const issues = [];
+  if (String(overview.summary || "").trim() === "") issues.push("summary が空です");
+  if (countFilledItems(overview.key_changes) === 0) issues.push("key_changes が0件です");
+  if (countFilledItems(overview.risks) === 0) issues.push("risks が0件です");
+  return issues;
+}
+
 // 理解度クイズの作りを確かめる。quiz を持たないstepは対象外
 function buildQuizIssues(steps) {
   const issues = [];
@@ -1198,6 +1214,7 @@ function buildStory(targetDir) {
   const validation = buildValidation(changes.change_ids, changes.files, steps.steps || []);
   return {
     title: steps.title || "",
+    overview: steps.overview || null,
     files: changes.files,
     change_ids: changes.change_ids,
     steps: validation.resolvedSteps,
@@ -1657,6 +1674,42 @@ function renderBanner(){
   box.className='banner';
   box.textContent=parts.join(' / ');
   banner.appendChild(box);
+}
+// 箇条書きの配列を、簡易 markdown の行頭 - に直す
+function buildBulletMarkdown(values){
+  return (values||[]).filter(function(value){return String(value).trim()!=='';}).map(function(value){return '- '+value;}).join('\\n');
+}
+function appendOverviewSection(box, label, text){
+  if(text==='') return;
+  if(label!==''){
+    var labelElement=document.createElement('div');
+    labelElement.className='overview-label';
+    labelElement.textContent=label;
+    box.appendChild(labelElement);
+  }
+  var body=document.createElement('div');
+  body.className='overview-body';
+  renderMarkdown(body, text);
+  box.appendChild(body);
+}
+// ストーリーの全体像。最初のステップでだけ、差分より前に出す
+function renderOverview(){
+  var box=document.getElementById('overview');
+  box.innerHTML='';
+  var overview=story.overview||{};
+  var summaryText=overview.summary||'';
+  var keyChangesText=buildBulletMarkdown(overview.key_changes);
+  var risksText=buildBulletMarkdown(overview.risks);
+  var hasContent=stepIndex===0&&(summaryText!==''||keyChangesText!==''||risksText!=='');
+  box.style.display=hasContent?'block':'none';
+  if(!hasContent) return;
+  var heading=document.createElement('div');
+  heading.className='overview-head';
+  heading.textContent='全体像';
+  box.appendChild(heading);
+  appendOverviewSection(box, '', summaryText);
+  appendOverviewSection(box, '主な変更', keyChangesText);
+  appendOverviewSection(box, '気をつける点', risksText);
 }
 function lineClass(line, ownsSet, refsSet){
   var kindClass=line.kind==='add'?'add':(line.kind==='del'?'del':'context');
@@ -2508,6 +2561,7 @@ function render(){
   document.getElementById('quizNote').textContent=(step&&!isStepPassed(step, stepIndex))?'理解度クイズに答えると次へ進めます':'';
   renderStepList();
   renderBanner();
+  renderOverview();
   renderDiagram(document.getElementById('diagram'), step?step.diagram:null);
   var diff=document.getElementById('diff');
   diff.innerHTML='';
@@ -2631,12 +2685,14 @@ function minimapFingerprint(){
   var changePart=(story.change_ids||[]).length;
   return stepPart+'@'+changePart;
 }
-// ミニマップ用の指紋に題名・タイトル・説明文・図・refsの件数・クイズの問題文・コメントと返信の件数を加えた文字列。差分や追従、説明文の書き換えによる変化の検知に使う
+// ミニマップ用の指紋に題名・全体像・タイトル・説明文・図・refsの件数・クイズの問題文・コメントと返信の件数を加えた文字列。差分や追従、説明文の書き換えによる変化の検知に使う
 function storyFingerprint(minimapPart){
   var stepPart=(story.steps||[]).map(function(step){return step.order+':'+step.title+':'+step.narration+':'+(step.diagram||'')+':'+(step.refs||[]).length+':'+(step.quiz?step.quiz.question:'');}).join('|');
+  var overview=story.overview||{};
+  var overviewPart=(overview.summary||'')+':'+(overview.key_changes||[]).join(',')+':'+(overview.risks||[]).join(',');
   var comments=story.comments||[];
   var commentPart=comments.length+'#'+comments.map(function(comment){return (comment.replies||[]).length;}).join(',');
-  return minimapPart+'@'+story.title+'@'+stepPart+'@'+commentPart;
+  return minimapPart+'@'+story.title+'@'+overviewPart+'@'+stepPart+'@'+commentPart;
 }
 var storySignature='';
 var minimapSignature='';
@@ -2754,6 +2810,10 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 .content{padding:24px 32px 80px}
 .banner-box{background:#fff8e6;border:1px solid #f0d68a;color:#7a5b00;padding:12px 16px;border-radius:10px;margin-bottom:16px}
 .done-msg{background:#e6f6ec;border:1px solid #a3d9b1;color:#1a7f37;padding:12px 16px;border-radius:10px;margin-bottom:16px}
+.overview{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:20px;padding:16px 18px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.overview-head{font-size:15px;font-weight:700;margin-bottom:8px}
+.overview-label{font-size:12px;font-weight:700;color:var(--text-soft);margin:12px 0 4px}
+.overview-body{font-size:14px;line-height:1.7}
 .diagram{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:20px;padding:14px 16px;overflow-x:auto;box-shadow:0 1px 2px rgba(0,0,0,.04)}
 .dg-svg{display:block}
 .dg-node{fill:var(--surface-soft);stroke:var(--border);stroke-width:1}
@@ -2894,6 +2954,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 <div class='content'>
 <div id='doneMsg' class='done-msg' style='display:none'>コメントを送信しました。AIの返信がまもなく各コメントの下に表示されます</div>
 <div id='banner'></div>
+<div id='overview' class='overview' style='display:none'></div>
 <div id='diagram' class='diagram' style='display:none'></div>
 <div id='diff'></div>
 </div>
@@ -2996,6 +3057,11 @@ function main() {
     if (diagramValidation.oversizedDiagramSteps.length > 0) {
       console.log("参考 ノードが目安 " + DIAGRAM_NODE_COUNT_MAX + "個を超える図(そのstepが触る呼び出し関係だけに絞る)");
       for (const line of diagramValidation.oversizedDiagramSteps) console.log("  " + line);
+    }
+    const overviewIssues = buildOverviewIssues(steps.overview);
+    if (overviewIssues.length > 0) {
+      console.log("参考 全体像の作り(レビューを始める前に読む場所なので埋めておく)");
+      for (const issue of overviewIssues) console.log("  " + issue);
     }
     return;
   }
@@ -3110,9 +3176,11 @@ module.exports.buildContextText = buildContextText;
 module.exports.fetchPullRequestOrNull = fetchPullRequestOrNull;
 module.exports.resolveSteps = resolveSteps;
 module.exports.buildValidation = buildValidation;
+module.exports.buildStory = buildStory;
 module.exports.buildUnassignedFileLines = buildUnassignedFileLines;
 module.exports.backfillMissingIds = backfillMissingIds;
 module.exports.buildQuizIssues = buildQuizIssues;
+module.exports.buildOverviewIssues = buildOverviewIssues;
 module.exports.parseDiagram = parseDiagram;
 module.exports.buildDiagramValidation = buildDiagramValidation;
 module.exports.VIEWER_HTML = VIEWER_HTML;
