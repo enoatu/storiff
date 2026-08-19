@@ -20,6 +20,12 @@ const DRAFT_HUNK_LINES_MAX = 10;
 // 区切りの下書きの仮の題の長さ。かたまりの見出しがそのまま長い1行のこともあるので切る
 const DRAFT_TITLE_LENGTH_MAX = 40;
 
+// 説明文を埋めるときに同時に走らせる claude の数。増やすほど1つあたりが遅くなり、先頭のコマが読めるまでが遅れる
+const FILL_PARALLEL_COUNT_MAX = 4;
+
+// 1ステップの説明文の目安の文字数。長い説明ほど書き終わるまで待たされるので、既定は短く保つ
+const FILL_NARRATION_LENGTH_GUIDE = 300;
+
 // 理解度クイズの選択肢の最小数。これより少ないと当てずっぽうでも通ってしまう
 const QUIZ_CHOICE_COUNT_MIN = 3;
 
@@ -1358,8 +1364,8 @@ function buildAskPrompt(targetDir, comment, changes) {
   return promptLines.join("\n");
 }
 
-function askHaiku(cwd, sessionId, prompt, onResult) {
-  const claudeArgs = ["-p", "--resume", sessionId, "--model", "haiku", "--no-session-persistence", "--output-format", "json", prompt];
+// claude を子プロセスで呼び、答えの文字列を返す。claude が無い環境や壊れた出力のときは空文字を返す
+function runClaude(cwd, claudeArgs, onResult) {
   const child = spawn("claude", claudeArgs, { cwd });
   const stdoutChunks = [];
   let isResultSent = false;
@@ -1383,6 +1389,10 @@ function askHaiku(cwd, sessionId, prompt, onResult) {
   child.on("error", () => sendResultOnce(""));
 }
 
+function askHaiku(cwd, sessionId, prompt, onResult) {
+  runClaude(cwd, ["-p", "--resume", sessionId, "--model", "haiku", "--no-session-persistence", "--output-format", "json", prompt], onResult);
+}
+
 // changes.json の cwd。無ければ現在の作業ディレクトリを使う
 function resolveCwd(changes) {
   return (changes && changes.cwd) || process.cwd();
@@ -1392,6 +1402,77 @@ function resolveCwd(changes) {
 function buildHaikuRequest(targetDir, comment) {
   const changes = readJson(path.join(targetDir, "changes.json"), { files: [] });
   return { cwd: resolveCwd(changes), prompt: buildAskPrompt(targetDir, comment, changes) };
+}
+
+// 1ステップ分の説明文を書かせるプロンプト。材料は全部読ませると遅くなるので、担当の変更IDのところだけでよいと伝える
+function buildFillPrompt(targetDir, step, stepNumber, stepCount) {
+  return [
+    "コード差分のレビューを紙芝居で見せます。その1コマ分の説明文を書いてください",
+    "",
+    "全 " + stepCount + " コマのうち " + stepNumber + " コマ目",
+    "コマの題 " + (step.title || ""),
+    "このコマが担当する変更ID " + (step.owns || []).map(String).join(","),
+    "",
+    "材料のファイル。担当の変更IDのところだけ読めばよく、全部を読む必要はありません",
+    path.join(targetDir, "changes.txt") + " 変更行の本体。行頭の [数字] が変更ID",
+    path.join(targetDir, "context.txt") + " ブランチ名とコミット本文と課題番号",
+    path.join(targetDir, "hints.txt") + " 名前をどこで定義しどこで使っているか",
+    "",
+    "書き方",
+    "- " + FILL_NARRATION_LENGTH_GUIDE + "文字程度、3行から5行。込み入ったコマだけ厚くしてよいが、既定は短く",
+    "- 何をしたかで止めず、なぜ必要だったかを書く",
+    "- 材料から読み取れないことは書かない。推測で補わない",
+    "- 説明文だけを出力する。前置きも見出しも付けない",
+  ].join("\n");
+}
+
+// 説明文を steps.json に書き戻す。複数の子プロセスの結果が同時に返っても壊れないよう、書くのは親プロセスのこの関数だけにする
+// 毎回読み直してから担当のステップだけ差し替えるので、先に書き戻された説明文を消さない
+function writeNarration(targetDir, stepIndex, narration) {
+  const stepsPath = path.join(targetDir, "steps.json");
+  const steps = readJson(stepsPath, { steps: [] });
+  const step = (steps.steps || [])[stepIndex];
+  if (step == null || String(step.narration || "").trim() !== "") return false;
+  step.narration = narration;
+  writeFileAtomic(stepsPath, JSON.stringify(steps, null, 2));
+  return true;
+}
+
+// narration が空のステップを先頭から順に埋める。書けたものから1件ずつ書き戻すので、全部終わるのを待たずに読み始められる
+function runFill(targetDir, onDone) {
+  const stepList = readJson(path.join(targetDir, "steps.json"), { steps: [] }).steps || [];
+  const emptySteps = stepList
+    .map((step, index) => ({ step, index }))
+    .filter((entry) => String(entry.step.narration || "").trim() === "");
+  const finish = (filledCount) => {
+    console.log("fill: 全 " + emptySteps.length + " 件のうち " + filledCount + " 件に説明文を書きました");
+    if (onDone) onDone(filledCount);
+  };
+  if (emptySteps.length === 0) {
+    finish(0);
+    return;
+  }
+  const cwd = resolveCwd(readJson(path.join(targetDir, "changes.json"), null));
+  let startedCount = 0;
+  let finishedCount = 0;
+  let filledCount = 0;
+  const startNext = () => {
+    if (startedCount >= emptySteps.length) return;
+    const target = emptySteps[startedCount];
+    startedCount++;
+    const prompt = buildFillPrompt(targetDir, target.step, target.index + 1, stepList.length);
+    const claudeArgs = ["-p", "--no-session-persistence", "--add-dir", targetDir, "--output-format", "json", prompt];
+    runClaude(cwd, claudeArgs, (narration) => {
+      finishedCount++;
+      if (narration.trim() !== "" && writeNarration(targetDir, target.index, narration.trim())) {
+        filledCount++;
+        console.log("fill: " + filledCount + "/" + emptySteps.length + " step" + (target.index + 1) + " " + (target.step.title || ""));
+      }
+      if (finishedCount === emptySteps.length) finish(filledCount);
+      startNext();
+    });
+  };
+  for (let slot = 0; slot < FILL_PARALLEL_COUNT_MAX; slot++) startNext();
 }
 
 function readBody(request) {
@@ -3038,7 +3119,7 @@ function main() {
   const command = args[0];
   const targetDir = args[1];
   if (!command || !targetDir) {
-    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] [--with-draft] | node storiff.js check <dir> [--strict] | node storiff.js reply <dir> <コメント番号> <本文> | node storiff.js serve <dir> [--port N] [--host H]");
+    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] [--with-draft] | node storiff.js fill <dir> | node storiff.js check <dir> [--strict] | node storiff.js reply <dir> <コメント番号> <本文> | node storiff.js serve <dir> [--port N] [--host H]");
     process.exit(1);
   }
   if (command === "check") {
@@ -3133,6 +3214,14 @@ function main() {
       console.log("参考 全体像の作り(レビューを始める前に読む場所なので埋めておく)");
       for (const issue of overviewIssues) console.log("  " + issue);
     }
+    return;
+  }
+  if (command === "fill") {
+    if (!fs.existsSync(path.join(targetDir, "steps.json"))) {
+      console.log("steps.json がありません: 先に prep --with-draft を実行してください");
+      process.exit(1);
+    }
+    runFill(targetDir);
     return;
   }
   if (command === "reply") {
@@ -3242,6 +3331,8 @@ module.exports.remapComments = remapComments;
 module.exports.runPrep = runPrep;
 module.exports.parseDiff = parseDiff;
 module.exports.buildDraftSteps = buildDraftSteps;
+module.exports.buildFillPrompt = buildFillPrompt;
+module.exports.runFill = runFill;
 module.exports.buildCommitRange = buildCommitRange;
 module.exports.collectIssueNumbers = collectIssueNumbers;
 module.exports.collectDocPaths = collectDocPaths;
