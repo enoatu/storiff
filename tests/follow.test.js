@@ -794,11 +794,11 @@ test("追従で居場所が無くなる説明文があれば、消えたこと�
   const { targetDir, binDir } = prepareFollowTarget(t);
   const stepsPath = path.join(targetDir, "steps.json");
   useFakeGitWritingSteps(t, binDir, stepsPath,
-    'steps.steps.push({ order: 9, title: "補足", narration: "check が足した説明", owns: [], refs: [] });');
+    'steps.steps.push({ order: 9, title: "あとから足した題", narration: "あとから書いた説明", owns: [], refs: [] });');
 
   const logLines = collectPrepLogs(() => runPrep(targetDir, [{ path: ".", diffArgs: [] }]));
   const followedSteps = JSON.parse(fs.readFileSync(stepsPath, "utf8"));
-  assert.strictEqual(followedSteps.steps.some((step) => step.title === "補足"), false);
+  assert.strictEqual(followedSteps.steps.some((step) => step.title === "あとから足した題"), false);
   assert.ok(logLines.some((line) => line.includes("説明文1ステップ分は、追従で居場所が無くなったので消えました")), logLines.join("\n"));
 });
 
