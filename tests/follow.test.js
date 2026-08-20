@@ -710,6 +710,98 @@ test("B2 引数で範囲を明示し直すと記録済みではなく新しい�
   assert.strictEqual(secondChanges.diff_target, "HEAD");
 });
 
+// git diff を待っている間に fill が steps.json を書いた状況を作る偽の git。差分の中身は本物にそのまま任せる
+function useFakeGitWritingSteps(t, binDir, stepsPath, changeStepsSource) {
+  const realGitPath = execFileSync("/bin/sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  const scriptPath = path.join(binDir, "git");
+  fs.writeFileSync(scriptPath, [
+    "#!" + process.execPath,
+    'const fs = require("fs");',
+    'const { execFileSync } = require("child_process");',
+    "const args = process.argv.slice(2);",
+    'if (args.includes("diff")) {',
+    "  const steps = JSON.parse(fs.readFileSync(" + JSON.stringify(stepsPath) + ', "utf8"));',
+    "  " + changeStepsSource,
+    "  fs.writeFileSync(" + JSON.stringify(stepsPath) + ", JSON.stringify(steps, null, 2));",
+    "}",
+    "try {",
+    "  process.stdout.write(execFileSync(" + JSON.stringify(realGitPath) + ', args, { maxBuffer: 1024 * 1024 * 64 }));',
+    "} catch (error) {",
+    "  if (error.stdout) process.stdout.write(error.stdout);",
+    "  if (error.stderr) process.stderr.write(error.stderr);",
+    "  process.exit(error.status == null ? 1 : error.status);",
+    "}",
+  ].join("\n") + "\n");
+  fs.chmodSync(scriptPath, 0o755);
+  const originalPath = process.env.PATH;
+  t.after(() => {
+    process.env.PATH = originalPath;
+  });
+  process.env.PATH = binDir + ":" + originalPath;
+}
+
+// runPrep が console.log に出した行を集める
+function collectPrepLogs(callback) {
+  const logLines = [];
+  const originalLog = console.log;
+  console.log = (...parts) => logLines.push(parts.join(" "));
+  try {
+    callback();
+  } finally {
+    console.log = originalLog;
+  }
+  return logLines;
+}
+
+function prepareFollowTarget(t) {
+  const originalCwd = process.cwd();
+  const repoDir = makeTempDir("storiff-repo-");
+  const targetDir = makeTempDir("storiff-target-");
+  const binDir = makeTempDir("storiff-bin-");
+  t.after(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(targetDir, { recursive: true, force: true });
+    fs.rmSync(binDir, { recursive: true, force: true });
+  });
+
+  makeGitRepo(repoDir);
+  commitFile(repoDir, "a.js", "line1\n", "first");
+  fs.writeFileSync(path.join(repoDir, "a.js"), "line1\nline2\n");
+  process.chdir(repoDir);
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  const firstChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify({
+    title: "題名",
+    steps: [{ order: 1, title: "タイトル", narration: "", owns: firstChanges.change_ids, refs: [] }],
+  }));
+  fs.writeFileSync(path.join(repoDir, "a.js"), "line1\nline2\nline3\n");
+  return { repoDir, targetDir, binDir };
+}
+
+test("追従の最中に fill が書いた説明文を引き継ぐ", (t) => {
+  const { targetDir, binDir } = prepareFollowTarget(t);
+  const stepsPath = path.join(targetDir, "steps.json");
+  useFakeGitWritingSteps(t, binDir, stepsPath, 'steps.steps[0].narration = "fill が書いた説明";');
+
+  const logLines = collectPrepLogs(() => runPrep(targetDir, [{ path: ".", diffArgs: [] }]));
+  const followedSteps = JSON.parse(fs.readFileSync(stepsPath, "utf8"));
+  assert.strictEqual(followedSteps.steps[0].narration, "fill が書いた説明");
+  assert.ok(logLines.some((line) => line.includes("fill が書いていた説明文1ステップ分を引き継ぎました")), logLines.join("\n"));
+});
+
+test("追従で居場所が無くなる説明文があれば、消えたことを知らせる", (t) => {
+  const { targetDir, binDir } = prepareFollowTarget(t);
+  const stepsPath = path.join(targetDir, "steps.json");
+  useFakeGitWritingSteps(t, binDir, stepsPath,
+    'steps.steps.push({ order: 9, title: "補足", narration: "check が足した説明", owns: [], refs: [] });');
+
+  const logLines = collectPrepLogs(() => runPrep(targetDir, [{ path: ".", diffArgs: [] }]));
+  const followedSteps = JSON.parse(fs.readFileSync(stepsPath, "utf8"));
+  assert.strictEqual(followedSteps.steps.some((step) => step.title === "補足"), false);
+  assert.ok(logLines.some((line) => line.includes("説明文1ステップ分は、追従で居場所が無くなったので消えました")), logLines.join("\n"));
+});
+
 test("B3 前回と同じ差分のとき、follow.jsonが新たに書かれない", (t) => {
   const originalCwd = process.cwd();
   const repoDir = makeTempDir("storiff-repo-");
