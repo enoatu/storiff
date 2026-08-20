@@ -25,8 +25,8 @@ const FILL_PARALLEL_COUNT_MAX = 4;
 // 説明文を書く子プロセスに許す道具。材料を読むだけでよく、steps.json のあるディレクトリに書かせない
 const FILL_ALLOWED_TOOLS = "Read,Glob,Grep";
 
-// 1ステップの説明文の目安の文字数。長い説明ほど書き終わるまで待たされるので、既定は短く保つ
-const FILL_NARRATION_LENGTH_GUIDE = 300;
+// 1ステップの説明文の上限の目安。流暢で長い説明は、読み手に分かった気だけを残すので短く保つ
+const FILL_NARRATION_LENGTH_GUIDE = 150;
 
 // 前回と今回のどちらかで同じ内容の行がこの本数を超えたら、単調増加列の候補から外し出現順に対応させる
 const SAME_CONTENT_LINE_COUNT_MAX = 100;
@@ -1137,6 +1137,18 @@ function buildOverviewIssues(overview) {
   return issues;
 }
 
+// 危ないところが無いステップに risks が無いのは正しい状態なので、書いてあるのに画面へ出ない形だけを拾う
+function buildStepRisksIssues(stepList) {
+  const issues = [];
+  stepList.forEach((step, index) => {
+    if (step.risks == null) return;
+    const order = step.order != null ? step.order : index + 1;
+    if (!Array.isArray(step.risks)) issues.push("step" + order + " risks が配列になっていません");
+    else if (countFilledItems(step.risks) === 0) issues.push("step" + order + " risks が空だけです。無いなら risks ごと消す");
+  });
+  return issues;
+}
+
 // ビューアにも同じ関数をそのまま埋め込むので、この関数の外を参照しない
 function parseDiagram(source) {
   const arrowRegexp = /\s*(-->|-\.->|==>)\s*(?:\|([^|]*)\|)?\s*/;
@@ -1484,8 +1496,9 @@ function buildFillPrompt(targetDir, step, stepNumber, stepCount, diffText) {
     path.join(targetDir, "hints.txt") + " 名前をどこで定義しどこで使っているか",
     "",
     "書き方",
-    "- " + FILL_NARRATION_LENGTH_GUIDE + "文字程度、3行から5行。込み入ったコマだけ厚くしてよいが、既定は短く",
-    "- 何をしたかで止めず、なぜ必要だったかを書く",
+    "- " + FILL_NARRATION_LENGTH_GUIDE + "文字以内。長い説明は読み手に分かった気だけを残すので短く書く",
+    "- 何をしたかは1文か2文まで。差分を読めば分かることを言いかえない",
+    "- 残りはなぜそうしたかに使う。削るのは何をしたかの側で、なぜは残す",
     "- 材料から読み取れないことは書かない。推測で補わない",
     "- 説明文だけを出力する。前置きも見出しも付けない",
   ].join("\n");
@@ -2029,6 +2042,22 @@ function renderOverview(){
   appendOverviewSection(box, '', summaryText);
   appendOverviewSection(box, '主な変更', keyChangesText);
   appendOverviewSection(box, '気をつける点', risksText);
+}
+// そのコマの不具合やリスク。説明文に混ぜると読み飛ばされるので、差分より前に別の枠で出す
+function renderStepRisks(step){
+  var box=document.getElementById('stepRisks');
+  box.innerHTML='';
+  var risksText=buildBulletMarkdown(step?step.risks:null);
+  box.style.display=risksText===''?'none':'block';
+  if(risksText==='') return;
+  var heading=document.createElement('div');
+  heading.className='step-risks-head';
+  heading.textContent='このコマで気をつける点';
+  box.appendChild(heading);
+  var body=document.createElement('div');
+  body.className='step-risks-body';
+  renderMarkdown(body, risksText);
+  box.appendChild(body);
 }
 function lineClass(line, ownsSet, refsSet){
   var kindClass=line.kind==='add'?'add':(line.kind==='del'?'del':'context');
@@ -2813,6 +2842,7 @@ function render(){
   renderResume();
   renderBanner();
   renderOverview();
+  renderStepRisks(step);
   renderDiagram(document.getElementById('diagram'), step?step.diagram:null);
   var diff=document.getElementById('diff');
   diff.innerHTML='';
@@ -2937,7 +2967,7 @@ function minimapFingerprint(){
   return stepPart+'@'+changePart;
 }
 function storyFingerprint(minimapPart){
-  var stepPart=(story.steps||[]).map(function(step){return step.order+':'+step.title+':'+step.narration+':'+(step.diagram||'')+':'+(step.refs||[]).length;}).join('|');
+  var stepPart=(story.steps||[]).map(function(step){return step.order+':'+step.title+':'+step.narration+':'+(step.diagram||'')+':'+buildBulletMarkdown(step.risks)+':'+(step.refs||[]).length;}).join('|');
   var overview=story.overview||{};
   var overviewPart=(overview.summary||'')+':'+buildBulletMarkdown(overview.key_changes)+':'+buildBulletMarkdown(overview.risks);
   var comments=story.comments||[];
@@ -3074,6 +3104,9 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 .overview-head{font-size:15px;font-weight:700;margin-bottom:8px}
 .overview-label{font-size:12px;font-weight:700;color:var(--text-soft);margin:12px 0 4px}
 .overview-body{font-size:14px;line-height:1.7}
+.step-risks{background:#fff8e6;border:1px solid #f0d68a;color:#7a5b00;border-radius:12px;margin-bottom:20px;padding:14px 16px}
+.step-risks-head{font-size:13px;font-weight:700;margin-bottom:6px}
+.step-risks-body{font-size:14px;line-height:1.7}
 .diagram{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:20px;padding:14px 16px;overflow-x:auto;box-shadow:0 1px 2px rgba(0,0,0,.04)}
 .dg-svg{display:block}
 .dg-node{fill:var(--surface-soft);stroke:var(--border);stroke-width:1}
@@ -3146,6 +3179,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
   }
   .done-btn:hover:not(:disabled){background:#5577ff}
   .banner-box{background:#2b2410;border-color:#5a4a1a;color:#e3c56b}
+  .step-risks{background:#2b2410;border-color:#5a4a1a;color:#e3c56b}
   .comment-line-lost{color:#e3c56b}
   .done-msg{background:#132a1a;border-color:#2f6b42;color:#5cc47f}
   .step-progress.done{color:#3fb950}
@@ -3208,6 +3242,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 <div id='doneMsg' class='done-msg' style='display:none'>コメントを送信しました。AIの返信がまもなく各コメントの下に表示されます</div>
 <div id='banner'></div>
 <div id='overview' class='overview' style='display:none'></div>
+<div id='stepRisks' class='step-risks' style='display:none'></div>
 <div id='diagram' class='diagram' style='display:none'></div>
 <div id='diff'></div>
 </div>
@@ -3286,6 +3321,11 @@ function main() {
     if (overviewIssues.length > 0) {
       console.log("参考 全体像の作り(レビューを始める前に読む場所なので埋めておく)");
       for (const issue of overviewIssues) console.log("  " + issue);
+    }
+    const stepRisksIssues = buildStepRisksIssues(steps.steps);
+    if (stepRisksIssues.length > 0) {
+      console.log("参考 気をつける点の作り(この形だと書いても画面に出ない)");
+      for (const issue of stepRisksIssues) console.log("  " + issue);
     }
     return;
   }
@@ -3424,6 +3464,7 @@ module.exports.readProgress = readProgress;
 module.exports.writeProgress = writeProgress;
 module.exports.buildUnassignedFileLines = buildUnassignedFileLines;
 module.exports.buildOverviewIssues = buildOverviewIssues;
+module.exports.buildStepRisksIssues = buildStepRisksIssues;
 module.exports.parseDiagram = parseDiagram;
 module.exports.buildDiagramValidation = buildDiagramValidation;
 module.exports.VIEWER_HTML = VIEWER_HTML;
