@@ -34,6 +34,9 @@ const SAME_CONTENT_LINE_COUNT_MAX = 100;
 // 単調増加列を計算する候補の総数がこれを超えたら、計算をやめて出現順に対応させる
 const MONOTONIC_CANDIDATE_COUNT_MAX = 5000000;
 
+// 1回の追従で覚えた本文をたどり直す行コメントの上限。人が書ける件数を超えたら照合をやめ、行を見失った印だけ立てる
+const COMMENT_TEXT_MATCH_COUNT_MAX = 1000;
+
 // 1stepの図に置けるノード数の目安。これを超えると全体の構成図に近づくので check が参考に出す
 const DIAGRAM_NODE_COUNT_MAX = 8;
 
@@ -523,12 +526,48 @@ function commentScope(comment) {
   return comment.scope === "step" || comment.scope === "story" ? comment.scope : "line";
 }
 
-// 行コメントのchange_idをidMapで新IDに写す。写せないものはnullにする。resolved と scope はそのまま残る
-function remapComments(comments, idMap) {
+function buildLineTextKey(repo, filePath, text) {
+  return [repo, filePath, text].join("\0");
+}
+
+// 変更行の本文から新IDを引く索引。行コメントは add と del のどちらを指しているか持たないので、種別はキーに入れない
+function buildLineTextIndex(files) {
+  const keyToIdsMap = new Map();
+  for (const file of files) {
+    for (const line of file.lines) {
+      if (line.id == null) continue;
+      const key = buildLineTextKey(file.repo, file.file, line.text);
+      if (!keyToIdsMap.has(key)) keyToIdsMap.set(key, []);
+      keyToIdsMap.get(key).push(line.id);
+    }
+  }
+  return keyToIdsMap;
+}
+
+// 覚えた本文と同じ変更行が同じファイルにちょうど1本だけあるときの新ID。それ以外は null
+// 同じ本文が複数あるとどれを指していたか決めようがなく、違う行に写すと読み手が誤った場所を信じてしまう
+function findIdByLineText(keyToIdsMap, comment) {
+  const ids = keyToIdsMap.get(buildLineTextKey(comment.repo, comment.file, comment.line_text));
+  return ids != null && ids.length === 1 ? ids[0] : null;
+}
+
+// 行コメントのchange_idをidMapで新IDに写す。写せないものは覚えた本文で探し直し、
+// それでも見つからないものは change_id を null にして line_lost を立てる。resolved と scope はそのまま残る
+function remapComments(comments, idMap, currentFiles) {
+  let keyToIdsMap = null;
+  let textMatchCount = 0;
   return comments.map((comment) => {
     if (commentScope(comment) !== "line") return comment;
-    const changeId = idMap.get(comment.change_id);
-    return Object.assign({}, comment, { change_id: changeId == null ? null : changeId });
+    let changeId = idMap.get(comment.change_id);
+    if (changeId == null && comment.line_text != null && textMatchCount < COMMENT_TEXT_MATCH_COUNT_MAX) {
+      textMatchCount += 1;
+      if (keyToIdsMap == null) keyToIdsMap = buildLineTextIndex(currentFiles || []);
+      changeId = findIdByLineText(keyToIdsMap, comment);
+    }
+    const remapped = Object.assign({}, comment, { change_id: changeId == null ? null : changeId });
+    if (changeId == null && comment.line_text != null) remapped.line_lost = true;
+    else delete remapped.line_lost;
+    return remapped;
   });
 }
 
@@ -968,7 +1007,7 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
     if (narrationCarry.carriedCount > 0) console.log("fill が書いていた説明文" + narrationCarry.carriedCount + "ステップ分を引き継ぎました");
     if (narrationCarry.lostCount > 0) console.log("説明文" + narrationCarry.lostCount + "ステップ分は、追従で居場所が無くなったので消えました。fill が動いている間は差分を取り込まないでください");
     writeFileAtomic(path.join(targetDir, "steps.json"), JSON.stringify(Object.assign({}, previousSteps, { steps: remappedSteps }), null, 2));
-    writeFileAtomic(path.join(targetDir, "comments.json"), JSON.stringify(remapComments(previousComments, idMap), null, 2));
+    writeFileAtomic(path.join(targetDir, "comments.json"), JSON.stringify(remapComments(previousComments, idMap, files), null, 2));
     writeFileAtomic(path.join(targetDir, "follow.json"), JSON.stringify({
       at: new Date().toISOString(),
       diff_target: changesJson.diff_target,
@@ -1271,10 +1310,15 @@ function buildStory(targetDir) {
   };
 }
 
+// 行コメントには対象の行の本文を line_text として残す。追従で change_id を写せなくなっても、この本文で行をたどり直せる
 function appendComment(targetDir, body) {
   const commentsPath = path.join(targetDir, "comments.json");
   const comments = readJson(commentsPath, []);
   const newComment = Object.assign({}, body, { replies: [], at: new Date().toISOString() });
+  if (commentScope(newComment) === "line") {
+    const target = findCommentTarget(readChanges(targetDir).files, newComment);
+    if (target.line != null) newComment.line_text = target.line.text;
+  }
   comments.push(newComment);
   writeFileAtomic(commentsPath, JSON.stringify(comments, null, 2));
   return { comment: newComment, commentNumber: comments.length };
@@ -1766,6 +1810,7 @@ var PROGRESS_SAVE_DELAY_MSEC=1500;
 var WORD_DIFF_SIMILARITY_MIN=0.75;
 var NARRATION_PENDING_TEXT='説明文をいま書いています。書けたコマから自動で出ます';
 var STEP_PENDING_LABEL='準備中';
+var COMMENT_LINE_LOST_TEXT='元の行が見つかりません。別の場所を指しているかもしれません';
 // 機械が作るステップの題。fill が説明文を書かないので、空でも準備中とは出さない
 var FOLLOW_STEP_TITLE_PATTERN=/^修正\\d+回目$/;
 
@@ -1852,6 +1897,7 @@ function saveProgressSoon(){
 // scope を持たない古いコメントは行コメントとして扱う
 function commentScope(comment){return comment.scope==='step'||comment.scope==='story'?comment.scope:'line';}
 function isResolvedComment(comment){return comment.resolved===true;}
+function isLineLostComment(comment){return comment.line_lost===true;}
 function shownComments(comments){
   if(showsResolvedComments) return comments||[];
   return (comments||[]).filter(function(comment){return !isResolvedComment(comment);});
@@ -2000,6 +2046,12 @@ function toggleResolved(comment){
 function renderComment(comment){
   var box=document.createElement('div');
   box.className=isResolvedComment(comment)?'comment resolved':'comment';
+  if(isLineLostComment(comment)){
+    var lostLabel=document.createElement('div');
+    lostLabel.className='comment-line-lost';
+    lostLabel.textContent=COMMENT_LINE_LOST_TEXT;
+    box.appendChild(lostLabel);
+  }
   var bodyLine=document.createElement('div');
   bodyLine.className='comment-body';
   bodyLine.textContent=comment.body;
@@ -2889,8 +2941,8 @@ function storyFingerprint(minimapPart){
   var overview=story.overview||{};
   var overviewPart=(overview.summary||'')+':'+buildBulletMarkdown(overview.key_changes)+':'+buildBulletMarkdown(overview.risks);
   var comments=story.comments||[];
-  // 解決の状態は comments.json が持ち主で、別のタブや skill からも変わるので指紋に入れる
-  var commentPart=comments.length+'#'+comments.map(function(comment){return (comment.replies||[]).length+(isResolvedComment(comment)?'r':'');}).join(',');
+  // 解決の状態と行を見失った印は comments.json が持ち主で、別のタブや skill や追従からも変わるので指紋に入れる
+  var commentPart=comments.length+'#'+comments.map(function(comment){return (comment.replies||[]).length+(isResolvedComment(comment)?'r':'')+(isLineLostComment(comment)?'l':'');}).join(',');
   return minimapPart+'@'+story.title+'@'+overviewPart+'@'+stepPart+'@'+commentPart;
 }
 var storySignature='';
@@ -3073,6 +3125,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 .reply-author{display:inline-block;font-size:11px;font-weight:700;color:var(--accent);margin-bottom:3px}
 .reply-body{white-space:normal;line-height:1.6}
 .comment.resolved{background:var(--surface-soft);border-left-color:var(--text-soft);opacity:.7}
+.comment-line-lost{font-size:11px;font-weight:700;color:#7a5b00;margin-bottom:4px}
 .comment-resolve{margin-top:6px;padding:2px 9px;font-size:11px;border-radius:6px}
 .comment-form{margin:4px 12px 8px 46px;display:flex;gap:8px}
 .comment-form input{flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:13px}
@@ -3093,6 +3146,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
   }
   .done-btn:hover:not(:disabled){background:#5577ff}
   .banner-box{background:#2b2410;border-color:#5a4a1a;color:#e3c56b}
+  .comment-line-lost{color:#e3c56b}
   .done-msg{background:#132a1a;border-color:#2f6b42;color:#5cc47f}
   .step-progress.done{color:#3fb950}
   .step-item.read .step-num{background:#173a24;color:#3fb950}

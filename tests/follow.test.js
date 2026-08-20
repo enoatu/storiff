@@ -4,7 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
-const { buildIdMap, foldIdsToRanges, remapSteps, remapComments, runPrep, resolveSteps, buildValidation } = require("../storiff.js");
+const { appendComment, buildIdMap, foldIdsToRanges, remapSteps, remapComments, runPrep, resolveSteps, buildValidation } = require("../storiff.js");
 
 function makeTempDir(prefix) {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
@@ -42,6 +42,10 @@ function idsFromOwns(owns) {
     }
   }
   return ids;
+}
+
+function readComments(targetDir) {
+  return JSON.parse(fs.readFileSync(path.join(targetDir, "comments.json"), "utf8"));
 }
 
 function textById(changes) {
@@ -219,6 +223,170 @@ test("コメントの change_id が写る。写せないコメントは change_i
   assert.strictEqual(remapped[1].change_id, null);
   assert.strictEqual(remapped[1].body, "本文2");
   assert.deepStrictEqual(remapped[1].replies, [{ author: "ai", body: "返信" }]);
+});
+
+test("対応表で写せなくても、覚えた本文と同じ変更行があればコメントがそこへ写る", () => {
+  const currentFiles = [makeFile(".", "a.js", [makeLine("add", "const user = db.find(id)", 7)])];
+  const comments = [{ scope: "line", change_id: 1, file: "a.js", repo: ".", line: 2, step_order: 1, body: "本文", line_text: "const user = db.find(id)", replies: [] }];
+  const remapped = remapComments(comments, new Map(), currentFiles);
+  assert.strictEqual(remapped[0].change_id, 7);
+  assert.strictEqual("line_lost" in remapped[0], false);
+});
+
+test("覚えた本文がどこにも無いとき、コメントに行を見失った印が付く", () => {
+  const currentFiles = [makeFile(".", "a.js", [makeLine("add", "まったく別の行", 7)])];
+  const comments = [{ scope: "line", change_id: 1, file: "a.js", repo: ".", line: 2, step_order: 1, body: "本文", line_text: "const user = db.find(id)", replies: [], resolved: true }];
+  const remapped = remapComments(comments, new Map(), currentFiles);
+  assert.strictEqual(remapped[0].change_id, null);
+  assert.strictEqual(remapped[0].line_lost, true);
+  assert.strictEqual(remapped[0].resolved, true);
+  assert.strictEqual(remapped[0].body, "本文");
+});
+
+test("覚えた本文と同じ変更行が2本あるとき、どちらにも写さず行を見失った印が付く", () => {
+  const currentFiles = [makeFile(".", "a.js", [makeLine("add", "return null", 7), makeLine("add", "return null", 8)])];
+  const comments = [{ scope: "line", change_id: 1, file: "a.js", repo: ".", line: 2, step_order: 1, body: "本文", line_text: "return null", replies: [] }];
+  const remapped = remapComments(comments, new Map(), currentFiles);
+  assert.strictEqual(remapped[0].change_id, null);
+  assert.strictEqual(remapped[0].line_lost, true);
+});
+
+test("覚えた本文が同じでも別ファイルの変更行には写らない", () => {
+  const currentFiles = [makeFile(".", "b.js", [makeLine("add", "return null", 7)])];
+  const comments = [{ scope: "line", change_id: 1, file: "a.js", repo: ".", line: 2, step_order: 1, body: "本文", line_text: "return null", replies: [] }];
+  const remapped = remapComments(comments, new Map(), currentFiles);
+  assert.strictEqual(remapped[0].change_id, null);
+  assert.strictEqual(remapped[0].line_lost, true);
+});
+
+test("行を見失った印は、次の追従で覚えた本文が見つかれば外れる", () => {
+  const comments = [{ scope: "line", change_id: null, file: "a.js", repo: ".", line: 2, step_order: 1, body: "本文", line_text: "const user = db.find(id)", line_lost: true, replies: [] }];
+  const currentFiles = [makeFile(".", "a.js", [makeLine("add", "const user = db.find(id)", 7)])];
+  const remapped = remapComments(comments, new Map(), currentFiles);
+  assert.strictEqual(remapped[0].change_id, 7);
+  assert.strictEqual("line_lost" in remapped[0], false);
+});
+
+test("覚えた本文で写せた次の追従で本文ごと消えると、行を見失った印が付き直す", () => {
+  const comments = [{ scope: "line", change_id: 7, file: "a.js", repo: ".", line: 2, step_order: 1, body: "本文", line_text: "const user = db.find(id)", replies: [] }];
+  const remapped = remapComments(comments, new Map(), [makeFile(".", "a.js", [])]);
+  assert.strictEqual(remapped[0].change_id, null);
+  assert.strictEqual(remapped[0].line_lost, true);
+});
+
+test("line_text を持たない古いコメントは、対応表だけで写り印も付かない", () => {
+  const currentFiles = [makeFile(".", "a.js", [makeLine("add", "残っている行", 7)])];
+  const comments = [
+    { change_id: 1, file: "a.js", line: 5, step_order: 1, body: "写せる本文", replies: [] },
+    { change_id: 99, file: "a.js", line: 9, step_order: 1, body: "写せない本文", replies: [] },
+  ];
+  const remapped = remapComments(comments, new Map([[1, 10]]), currentFiles);
+  assert.strictEqual(remapped[0].change_id, 10);
+  assert.strictEqual(remapped[1].change_id, null);
+  assert.strictEqual("line_lost" in remapped[0], false);
+  assert.strictEqual("line_lost" in remapped[1], false);
+});
+
+test("行を持たないコマとストーリーへのコメントには、覚えた本文の照合が働かない", () => {
+  const currentFiles = [makeFile(".", "a.js", [makeLine("add", "残っている行", 7)])];
+  const remapped = remapComments([{ scope: "step", step_order: 1, body: "このコマの方針が違う", replies: [] }], new Map(), currentFiles);
+  assert.strictEqual("change_id" in remapped[0], false);
+  assert.strictEqual("line_lost" in remapped[0], false);
+});
+
+test("覚えた本文をたどり直す行コメントが上限を超えると、超えたぶんは照合されず印だけが付く", () => {
+  const lines = Array.from({ length: 1001 }, (unused, index) => makeLine("add", "行" + index, index + 1));
+  const comments = lines.map((line) => ({ scope: "line", change_id: 900000 + line.id, file: "big.js", repo: ".", line: line.id, step_order: 1, body: "ここなぜ?", line_text: line.text, replies: [] }));
+  const remapped = remapComments(comments, new Map(), [makeFile(".", "big.js", lines)]);
+  assert.strictEqual(remapped[999].change_id, 1000);
+  assert.strictEqual(remapped[1000].change_id, null);
+  assert.strictEqual(remapped[1000].line_lost, true);
+});
+
+test("変更行が4万件あって写せない行コメントが上限まで並んでも、覚えた本文の照合が現実的な時間で終わる", () => {
+  const lines = Array.from({ length: 40000 }, (unused, index) => makeLine("add", "const value" + index + " = compute(" + index + ")", index + 1));
+  const comments = lines.slice(0, 1000).map((line) => ({ scope: "line", change_id: 900000 + line.id, file: "big.js", repo: ".", line: line.id, step_order: 1, body: "ここなぜ?", line_text: line.text, replies: [] }));
+  const startedAt = Date.now();
+  const remapped = remapComments(comments, new Map(), [makeFile(".", "big.js", lines)]);
+  const elapsedMsec = Date.now() - startedAt;
+  assert.strictEqual(remapped[0].change_id, 1);
+  assert.ok(elapsedMsec < 1000, "覚えた本文の照合に " + elapsedMsec + "ms かかった");
+});
+
+test("行を動かすと対応表では写せないが、覚えた本文でコメントが追いかけ、行ごと消すと印が付き、戻すと印が外れる", (t) => {
+  const originalCwd = process.cwd();
+  const repoDir = makeTempDir("storiff-repo-");
+  const targetDir = makeTempDir("storiff-target-");
+  t.after(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(targetDir, { recursive: true, force: true });
+  });
+
+  makeGitRepo(repoDir);
+  commitFile(repoDir, "a.js", "base\n", "first");
+  fs.writeFileSync(path.join(repoDir, "a.js"), "base\nkeepA\nkeepB\nkeepC\ntargetLine\nkeepD\n");
+
+  process.chdir(repoDir);
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  const firstChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify({
+    steps: [{ order: 1, title: "タイトル", narration: "説明", owns: firstChanges.change_ids, refs: [] }],
+  }));
+  const targetLine = firstChanges.files[0].lines.find((line) => line.text === "targetLine");
+  appendComment(targetDir, { scope: "line", change_id: targetLine.id, file: "a.js", repo: ".", line: targetLine.new, step_order: 1, body: "ここなぜ?" });
+  assert.strictEqual(readComments(targetDir)[0].line_text, "targetLine");
+
+  fs.writeFileSync(path.join(repoDir, "a.js"), "base\ntargetLine\nkeepA\nkeepB\nkeepC\nkeepD\n");
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  const movedFollow = JSON.parse(fs.readFileSync(path.join(targetDir, "follow.json"), "utf8"));
+  const movedComment = readComments(targetDir)[0];
+  assert.ok(movedFollow.lost_ids.includes(targetLine.id), "対応表が写せてしまい、覚えた本文の照合を試せていない");
+  assert.strictEqual(textById(JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"))).get(movedComment.change_id), "targetLine");
+  assert.strictEqual("line_lost" in movedComment, false);
+
+  fs.writeFileSync(path.join(repoDir, "a.js"), "base\nkeepA\nkeepB\nkeepC\nkeepD\n");
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  const lostComment = readComments(targetDir)[0];
+  assert.strictEqual(lostComment.change_id, null);
+  assert.strictEqual(lostComment.line_lost, true);
+  assert.strictEqual(lostComment.body, "ここなぜ?");
+
+  fs.writeFileSync(path.join(repoDir, "a.js"), "base\nkeepA\nkeepB\ntargetLine\nkeepC\nkeepD\n");
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  const foundAgainComment = readComments(targetDir)[0];
+  assert.strictEqual(textById(JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"))).get(foundAgainComment.change_id), "targetLine");
+  assert.strictEqual("line_lost" in foundAgainComment, false);
+});
+
+test("コメント対象の行そのものを書き換えると、覚えた本文でも見つからず印が付く", (t) => {
+  const originalCwd = process.cwd();
+  const repoDir = makeTempDir("storiff-repo-");
+  const targetDir = makeTempDir("storiff-target-");
+  t.after(() => {
+    process.chdir(originalCwd);
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(targetDir, { recursive: true, force: true });
+  });
+
+  makeGitRepo(repoDir);
+  commitFile(repoDir, "a.js", "base\n", "first");
+  fs.writeFileSync(path.join(repoDir, "a.js"), "base\ntargetLine\n");
+
+  process.chdir(repoDir);
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  const firstChanges = JSON.parse(fs.readFileSync(path.join(targetDir, "changes.json"), "utf8"));
+  fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify({
+    steps: [{ order: 1, title: "タイトル", narration: "説明", owns: firstChanges.change_ids, refs: [] }],
+  }));
+  const targetLine = firstChanges.files[0].lines.find((line) => line.text === "targetLine");
+  appendComment(targetDir, { scope: "line", change_id: targetLine.id, file: "a.js", repo: ".", line: targetLine.new, step_order: 1, body: "ここなぜ?" });
+
+  fs.writeFileSync(path.join(repoDir, "a.js"), "base\ntargetLineEdited\n");
+  runPrep(targetDir, [{ path: ".", diffArgs: [] }]);
+  const editedComment = readComments(targetDir)[0];
+  assert.strictEqual(editedComment.change_id, null);
+  assert.strictEqual(editedComment.line_lost, true);
 });
 
 test("別ディレクトリから追従しても cwd の目印が保たれ、以後どちらのディレクトリからでも追従できる", (t) => {
