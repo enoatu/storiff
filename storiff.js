@@ -28,9 +28,6 @@ const FILL_ALLOWED_TOOLS = "Read,Glob,Grep";
 // 1ステップの説明文の目安の文字数。長い説明ほど書き終わるまで待たされるので、既定は短く保つ
 const FILL_NARRATION_LENGTH_GUIDE = 300;
 
-// 理解度クイズの選択肢の最小数。これより少ないと当てずっぽうでも通ってしまう
-const QUIZ_CHOICE_COUNT_MIN = 3;
-
 // 前回と今回のどちらかで同じ内容の行がこの本数を超えたら、単調増加列の候補から外し出現順に対応させる
 const SAME_CONTENT_LINE_COUNT_MAX = 100;
 
@@ -953,7 +950,6 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
     if (remoteItemCount > 0) materialNotes.push("PRと課題 " + remoteItemCount + "件");
     console.log("意図の材料: " + contextPath + " (" + materialNotes.join(", ") + ")");
   }
-  if (config.quiz) console.log("理解度クイズ: 有効。各ステップに quiz を1問つける");
   if (useDraft === true && !hasPreviousSteps) {
     const draftSteps = buildDraftSteps(files);
     const draftPath = path.join(targetDir, "steps.json");
@@ -1093,25 +1089,6 @@ function buildOverviewIssues(overview) {
   else if (countFilledItems(overview.key_changes) === 0) issues.push("key_changes が0件です");
   if (overview.risks != null && !Array.isArray(overview.risks)) issues.push("risks が配列になっていません");
   else if (countFilledItems(overview.risks) === 0) issues.push("risks が0件です");
-  return issues;
-}
-
-function buildQuizIssues(steps) {
-  const issues = [];
-  steps.forEach((step, index) => {
-    const quiz = step.quiz;
-    if (quiz == null) return;
-    const choices = Array.isArray(quiz.choices) ? quiz.choices : [];
-    const uniqueChoices = new Set(choices.map((choice) => String(choice).trim()));
-    const reasons = [];
-    if (!quiz.question) reasons.push("question が空です");
-    if (choices.length < QUIZ_CHOICE_COUNT_MIN) reasons.push("choices が " + QUIZ_CHOICE_COUNT_MIN + "つに足りません");
-    if (uniqueChoices.size !== choices.length) reasons.push("choices に同じ選択肢があります");
-    if (!Number.isInteger(quiz.answer) || quiz.answer < 1 || quiz.answer > choices.length) reasons.push("answer が選択肢の番号(1始まり)になっていません");
-    if (!quiz.explanation) reasons.push("explanation が空です");
-    if (reasons.length === 0) return;
-    issues.push({ order: step.order != null ? step.order : index + 1, title: step.title || "", reasons });
-  });
   return issues;
 }
 
@@ -1726,10 +1703,6 @@ var CONTEXT_LINES=3;
 var FOLLOW_COOLDOWN_MSEC=5000;
 // 単語単位で色を分けてよいと判断する、共通するトークンの最低の割合
 var WORD_DIFF_SIMILARITY_MIN=0.75;
-// 理解度クイズの選択肢の最小数。これに満たないクイズは壊れているとみなして関門にしない
-var QUIZ_CHOICE_COUNT_MIN=3;
-var QUIZ_WRONG_COUNT_TO_REVEAL=2;
-var quizStateByOrder={};
 var NARRATION_PENDING_TEXT='説明文をいま書いています。書けたコマから自動で出ます';
 var STEP_PENDING_LABEL='準備中';
 // 機械が作るステップの題。fill が説明文を書かないので、空でも準備中とは出さない
@@ -2572,126 +2545,8 @@ function minimapJump(clientY){
   }
 }
 
-// 選べる形になっているクイズだけを返す。壊れたクイズで先へ進めなくならないようにする
-function getValidQuiz(step){
-  var quiz=step&&step.quiz;
-  if(!quiz||!quiz.question||!quiz.explanation) return null;
-  var choices=quiz.choices||[];
-  if(choices.length<QUIZ_CHOICE_COUNT_MIN) return null;
-  if(!(quiz.answer>=1&&quiz.answer<=choices.length)) return null;
-  return quiz;
-}
-function quizStateOf(stepOrder){
-  if(!quizStateByOrder[stepOrder]) quizStateByOrder[stepOrder]={pickedNumber:null, wrongCount:0, isPassed:false, isFirstTry:false, isRevealed:false};
-  return quizStateByOrder[stepOrder];
-}
-// クイズが無いステップと、正解したか答えを見たステップは通過ずみ
-function isStepPassed(step, index){
-  if(!getValidQuiz(step)) return true;
-  return quizStateOf(stepNumber(step, index)).isPassed;
-}
-function canGoNext(){
-  if(stepIndex>=story.steps.length-1) return false;
-  return isStepPassed(story.steps[stepIndex], stepIndex);
-}
+function canGoNext(){return stepIndex<story.steps.length-1;}
 function goToStep(nextIndex){stepIndex=nextIndex;render();window.scrollTo(0,0);}
-// 選んだ番号を採点する。正解したステップは選び直せない
-function answerQuiz(stepOrder, quiz, pickedNumber){
-  var state=quizStateOf(stepOrder);
-  if(state.isPassed) return;
-  state.pickedNumber=pickedNumber;
-  if(pickedNumber===quiz.answer){
-    state.isPassed=true;
-    state.isFirstTry=state.wrongCount===0;
-  }else{
-    state.wrongCount++;
-  }
-  render();
-}
-function renderQuizResult(state, quiz){
-  var resultBox=document.createElement('div');
-  if(state.isPassed){
-    resultBox.className='quiz-result';
-    var resultHead=document.createElement('div');
-    resultHead.className='quiz-result-head';
-    resultHead.textContent=state.isRevealed?('答えは '+quiz.answer+' 番です'):(state.isFirstTry?'一発で正解しました':'正解しました');
-    var explanationBox=document.createElement('div');
-    renderMarkdown(explanationBox, quiz.explanation);
-    resultBox.appendChild(resultHead);
-    resultBox.appendChild(explanationBox);
-    return resultBox;
-  }
-  if(state.wrongCount>0){
-    resultBox.className='quiz-result miss';
-    resultBox.textContent='ちがいます。差分と説明をもう一度読んでから選び直してください';
-    return resultBox;
-  }
-  resultBox.className='quiz-result hint';
-  resultBox.textContent='差分を読んで答えると、次のステップへ進めます';
-  return resultBox;
-}
-function renderQuiz(stepOrder, quiz){
-  var state=quizStateOf(stepOrder);
-  var card=document.createElement('div');
-  card.className='file';
-  var heading=document.createElement('div');
-  heading.className='file-head quiz-heading';
-  heading.textContent='理解度クイズ';
-  card.appendChild(heading);
-  var questionBox=document.createElement('div');
-  questionBox.className='quiz-question';
-  renderMarkdown(questionBox, quiz.question);
-  card.appendChild(questionBox);
-  var choiceList=document.createElement('div');
-  choiceList.className='quiz-choices';
-  quiz.choices.forEach(function(choice, choiceIndex){
-    var choiceNumber=choiceIndex+1;
-    var choiceButton=document.createElement('button');
-    choiceButton.className='quiz-choice';
-    if(state.isPassed&&choiceNumber===quiz.answer) choiceButton.className+=' correct';
-    if(state.pickedNumber===choiceNumber&&choiceNumber!==quiz.answer) choiceButton.className+=' wrong';
-    choiceButton.textContent=choiceNumber+'. '+choice;
-    choiceButton.disabled=state.isPassed;
-    choiceButton.onclick=function(){answerQuiz(stepOrder, quiz, choiceNumber);};
-    choiceList.appendChild(choiceButton);
-  });
-  card.appendChild(choiceList);
-  card.appendChild(renderQuizResult(state, quiz));
-  var actionRow=document.createElement('div');
-  actionRow.className='quiz-actions';
-  var readAgainButton=document.createElement('button');
-  readAgainButton.textContent='もう一度読む';
-  readAgainButton.onclick=function(){window.scrollTo(0,0);};
-  actionRow.appendChild(readAgainButton);
-  if(!state.isPassed&&state.wrongCount>=QUIZ_WRONG_COUNT_TO_REVEAL){
-    var revealButton=document.createElement('button');
-    revealButton.textContent='答えを見て進む';
-    revealButton.onclick=function(){
-      state.isPassed=true;
-      state.isRevealed=true;
-      render();
-    };
-    actionRow.appendChild(revealButton);
-  }
-  card.appendChild(actionRow);
-  return card;
-}
-// クイズのある全ステップを通過したときだけ、一発で正解した数を出す
-function renderQuizSummary(){
-  var quizCount=0, passedCount=0, firstTryCount=0;
-  story.steps.forEach(function(step, index){
-    if(!getValidQuiz(step)) return;
-    quizCount++;
-    var state=quizStateOf(stepNumber(step, index));
-    if(state.isPassed) passedCount++;
-    if(state.isFirstTry) firstTryCount++;
-  });
-  if(quizCount===0||passedCount<quizCount) return null;
-  var box=document.createElement('div');
-  box.className='quiz-summary';
-  box.textContent='理解度クイズ '+quizCount+'問中 '+firstTryCount+'問を一発で正解しました';
-  return box;
-}
 function render(){
   var step=story.steps[stepIndex];
   document.getElementById('storyTitle').textContent=story.title||'storiff';
@@ -2703,7 +2558,6 @@ function render(){
   document.getElementById('counter').textContent='Step '+(step?stepNumber(step, stepIndex):0)+' / '+story.steps.length;
   document.getElementById('prevBtn').disabled=stepIndex<=0;
   document.getElementById('nextBtn').disabled=!canGoNext();
-  document.getElementById('quizNote').textContent=(step&&!isStepPassed(step, stepIndex))?'理解度クイズに答えると次へ進めます':'';
   renderStepList();
   renderBanner();
   renderOverview();
@@ -2729,12 +2583,6 @@ function render(){
     lostBox.appendChild(lostHeading);
     lostComments.forEach(function(comment){lostBox.appendChild(renderComment(comment));});
     diff.appendChild(lostBox);
-  }
-  var quiz=getValidQuiz(step);
-  if(quiz) diff.appendChild(renderQuiz(stepNumber(step, stepIndex), quiz));
-  if(stepIndex===story.steps.length-1){
-    var summary=renderQuizSummary();
-    if(summary) diff.appendChild(summary);
   }
   buildMinimap();
   updateMinimapViewport();
@@ -2830,7 +2678,7 @@ function minimapFingerprint(){
   return stepPart+'@'+changePart;
 }
 function storyFingerprint(minimapPart){
-  var stepPart=(story.steps||[]).map(function(step){return step.order+':'+step.title+':'+step.narration+':'+(step.diagram||'')+':'+(step.refs||[]).length+':'+(step.quiz?step.quiz.question:'');}).join('|');
+  var stepPart=(story.steps||[]).map(function(step){return step.order+':'+step.title+':'+step.narration+':'+(step.diagram||'')+':'+(step.refs||[]).length;}).join('|');
   var overview=story.overview||{};
   var overviewPart=(overview.summary||'')+':'+buildBulletMarkdown(overview.key_changes)+':'+buildBulletMarkdown(overview.risks);
   var comments=story.comments||[];
@@ -3012,20 +2860,6 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 .comment-form{margin:4px 12px 8px 46px;display:flex;gap:8px}
 .comment-form input{flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:13px}
 .lost-comments-heading{font-size:13px;font-weight:600;color:var(--text-soft)}
-.quiz-note{font-size:12px;color:var(--text-soft)}
-.quiz-heading{font-size:13px;font-weight:700;color:var(--accent);background:var(--accent-soft)}
-.quiz-question{padding:14px 16px;font-size:14px;line-height:1.7}
-.quiz-choices{display:flex;flex-direction:column;gap:8px;padding:0 16px}
-.quiz-choice{text-align:left;line-height:1.6;white-space:normal}
-.quiz-choice:disabled{opacity:1}
-.quiz-choice.correct{background:#e6f6ec;border-color:#a3d9b1;color:#1a7f37;font-weight:600}
-.quiz-choice.wrong{background:#ffebe9;border-color:#f0b1ab;color:#cf222e}
-.quiz-result{margin:14px 16px 0;padding:11px 14px;border-radius:8px;font-size:13px;line-height:1.7;background:#e6f6ec;border:1px solid #a3d9b1;color:#1a7f37}
-.quiz-result.miss{background:#ffebe9;border-color:#f0b1ab;color:#cf222e}
-.quiz-result.hint{background:var(--surface-soft);border-color:var(--border-soft);color:var(--text-soft)}
-.quiz-result-head{font-weight:700;margin-bottom:4px}
-.quiz-actions{display:flex;gap:8px;padding:14px 16px}
-.quiz-summary{background:var(--accent-soft);border:1px solid var(--accent);color:var(--accent);padding:14px 16px;border-radius:12px;font-weight:600;margin-bottom:20px}
 @media (prefers-color-scheme: dark){
   :root{
     --text-main:#e6edf3;
@@ -3040,10 +2874,6 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
   .done-btn:hover:not(:disabled){background:#5577ff}
   .banner-box{background:#2b2410;border-color:#5a4a1a;color:#e3c56b}
   .done-msg{background:#132a1a;border-color:#2f6b42;color:#5cc47f}
-  .quiz-choice.correct{background:#132a1a;border-color:#2f6b42;color:#5cc47f}
-  .quiz-choice.wrong{background:#291416;border-color:#6b2f2f;color:#f85149}
-  .quiz-result{background:#132a1a;border-color:#2f6b42;color:#5cc47f}
-  .quiz-result.miss{background:#291416;border-color:#6b2f2f;color:#f85149}
   .file-head .status{background:#2a2f38}
   .file-note{background:#0f141b}
   .add{background:#12261a}
@@ -3083,7 +2913,6 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 <span id='counter' class='counter'></span>
 <button id='prevBtn'>前へ</button>
 <button id='nextBtn'>次へ</button>
-<span id='quizNote' class='quiz-note'></span>
 <div class='view-toggle'>
 <button id='unifiedBtn' class='view-toggle-btn'>統合</button>
 <button id='splitBtn' class='view-toggle-btn active'>左右並列</button>
@@ -3135,14 +2964,6 @@ function main() {
       if (validation.unknown_files.length > 0) console.log("  不明なファイル: " + validation.unknown_files.join(", "));
       process.exit(1);
     }
-    const quizIssues = buildQuizIssues(steps.steps);
-    if (quizIssues.length > 0) {
-      console.log("ng: 理解度クイズの作りが正しくありません");
-      for (const issue of quizIssues) {
-        console.log("  step" + issue.order + " " + issue.title + " (" + issue.reasons.join(", ") + ")");
-      }
-      process.exit(1);
-    }
     const diagramValidation = buildDiagramValidation(validation.resolvedSteps);
     if (diagramValidation.problems.length > 0) {
       console.log("ng: 図の書き方を直す。使えるのは flowchart の書き出しと、名前[ラベル] の宣言と、A --> B の矢印だけ");
@@ -3169,11 +2990,9 @@ function main() {
       }
       process.exit(1);
     }
-    const quizStepCount = steps.steps.filter((step) => step.quiz != null).length;
-    const quizNote = quizStepCount > 0 ? "(理解度クイズ " + quizStepCount + "問)" : "";
     const diagramStepCount = steps.steps.filter((step) => step.diagram != null && String(step.diagram).trim() !== "").length;
     const diagramNote = diagramStepCount > 0 ? "(図 " + diagramStepCount + "枚)" : "";
-    console.log("ok: 全" + changes.change_ids.length + "件の変更IDがちょうど1回ずつ owns に入っています" + quizNote + diagramNote);
+    console.log("ok: 全" + changes.change_ids.length + "件の変更IDがちょうど1回ずつ owns に入っています" + diagramNote);
     if (advisory.length > 0) {
       console.log("参考 目安 " + CHANGED_LINES_PER_STEP_GUIDE + "行を超えるstep(浅く広い機械的変更や自動生成物ならこのままでよい。密な実装なら分割を検討)");
       for (const step of advisory) {
@@ -3317,7 +3136,6 @@ module.exports.resolveSteps = resolveSteps;
 module.exports.buildValidation = buildValidation;
 module.exports.buildStory = buildStory;
 module.exports.buildUnassignedFileLines = buildUnassignedFileLines;
-module.exports.buildQuizIssues = buildQuizIssues;
 module.exports.buildOverviewIssues = buildOverviewIssues;
 module.exports.parseDiagram = parseDiagram;
 module.exports.buildDiagramValidation = buildDiagramValidation;
