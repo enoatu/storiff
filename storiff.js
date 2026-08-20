@@ -518,9 +518,15 @@ function remapSteps(previousFiles, stepList, idMap) {
   });
 }
 
-// コメントのchange_idをidMapで新IDに写す。写せないものはnullにする
+// scope を持たない古いコメントは行コメントとして扱う
+function commentScope(comment) {
+  return comment.scope === "step" || comment.scope === "story" ? comment.scope : "line";
+}
+
+// 行コメントのchange_idをidMapで新IDに写す。写せないものはnullにする。resolved と scope はそのまま残る
 function remapComments(comments, idMap) {
   return comments.map((comment) => {
+    if (commentScope(comment) !== "line") return comment;
     const changeId = idMap.get(comment.change_id);
     return Object.assign({}, comment, { change_id: changeId == null ? null : changeId });
   });
@@ -1273,13 +1279,25 @@ function appendComment(targetDir, body) {
   writeFileAtomic(commentsPath, JSON.stringify(comments, null, 2));
   return { comment: newComment, commentNumber: comments.length };
 }
-function appendReply(targetDir, commentNumber, body) {
+// 返信が付いたコメントは未解決に戻す。解決済みを隠したままだと新しい返信が読まれずに埋もれるため
+function appendReply(targetDir, commentNumber, body, keepsResolved) {
   const commentsPath = path.join(targetDir, "comments.json");
   const comments = readJson(commentsPath, []);
   const target = comments[commentNumber - 1];
   if (!target) throw new Error("コメント番号が範囲外です: " + commentNumber);
   if (!Array.isArray(target.replies)) target.replies = [];
   target.replies.push({ author: "ai", body: body, at: new Date().toISOString() });
+  if (keepsResolved !== true) target.resolved = false;
+  writeFileAtomic(commentsPath, JSON.stringify(comments, null, 2));
+  return target;
+}
+
+function setCommentResolved(targetDir, commentNumber, resolved) {
+  const commentsPath = path.join(targetDir, "comments.json");
+  const comments = readJson(commentsPath, []);
+  const target = comments[commentNumber - 1];
+  if (!target) throw new Error("コメント番号が範囲外です: " + commentNumber);
+  target.resolved = resolved === true;
   writeFileAtomic(commentsPath, JSON.stringify(comments, null, 2));
   return target;
 }
@@ -1305,13 +1323,25 @@ function findCommentTarget(files, comment) {
   return { file, line: null };
 }
 
+// 範囲ごとに答えるのに要る材料だけを渡す。行なら対象の行とそのステップの差分、ステップならそのステップの差分、ストーリーならコマの一覧
 function buildAskPrompt(targetDir, comment, changes) {
   const resolvedChanges = changes || readChanges(targetDir);
   const steps = readSteps(targetDir);
+  const scope = commentScope(comment);
+  if (scope === "story") {
+    const titleLines = (steps.steps || []).map((candidate, index) => (candidate.order != null ? candidate.order : index + 1) + " " + (candidate.title || ""));
+    return ["以下のストーリー全体について、レビュアーからの質問に簡潔に答えてください", "",
+      "ストーリーの題 " + (steps.title || ""), "", "コマの一覧", ...titleLines, "", "質問 " + comment.body].join("\n");
+  }
   const target = findCommentTarget(resolvedChanges.files, comment);
   const step = steps.steps.find((candidate) => (candidate.order != null ? candidate.order : 0) === comment.step_order);
   const resolvedStep = step ? resolveSteps(resolvedChanges.files, [step]).resolvedSteps[0] : null;
   const ownedIds = resolvedStep ? new Set([...resolvedStep.owns, ...resolvedStep.refs]) : null;
+  if (scope === "step") {
+    return ["以下のコマについて、レビュアーからの質問に簡潔に答えてください", "",
+      "コマの題 " + (step ? step.title : ""), "ストーリーの説明 " + (step ? step.narration : ""), "",
+      "このコマの差分", buildChangesText(resolvedChanges.files, ownedIds || new Set()), "質問 " + comment.body].join("\n");
+  }
   if (ownedIds && target.line) ownedIds.add(target.line.id);
   const diffText = target.file ? buildFileDiffText(target.file, ownedIds) : "";
   const narration = step ? step.narration : "";
@@ -1564,6 +1594,11 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
         }
         return;
       }
+      if (request.method === "POST" && request.url === "/resolve") {
+        const body = await readBody(request);
+        sendJson(response, 200, setCommentResolved(targetDir, body.comment_number, body.resolved));
+        return;
+      }
       if (request.method === "POST" && request.url === "/progress") {
         const body = await readBody(request);
         sendJson(response, 200, writeProgress(targetDir, body));
@@ -1720,6 +1755,7 @@ function startServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
 
 const VIEWER_SCRIPT = `
 var story=null, stepIndex=0, commentsByKey={}, lostCommentsByStep={};
+var stepCommentsByStep={}, storyComments=[], showsResolvedComments=false;
 var readStepOrders={}, resumeStepOrder=null, progressSaveTimer=null;
 var viewMode='split';
 var CONTEXT_LINES=3;
@@ -1813,22 +1849,34 @@ function saveProgressSoon(){
     })}).catch(function(){});
   }, PROGRESS_SAVE_DELAY_MSEC);
 }
+// scope を持たない古いコメントは行コメントとして扱う
+function commentScope(comment){return comment.scope==='step'||comment.scope==='story'?comment.scope:'line';}
+function isResolvedComment(comment){return comment.resolved===true;}
+function shownComments(comments){
+  if(showsResolvedComments) return comments||[];
+  return (comments||[]).filter(function(comment){return !isResolvedComment(comment);});
+}
+function pushComment(bucket, key, comment){
+  if(!bucket[key]) bucket[key]=[];
+  bucket[key].push(comment);
+}
 function indexComments(){
   commentsByKey={};
   lostCommentsByStep={};
+  stepCommentsByStep={};
+  storyComments=[];
   var stepOrders=(story.steps||[]).map(function(step, index){return stepNumber(step, index);});
   var lastStepOrder=stepOrders.length>0?stepOrders[stepOrders.length-1]:null;
-  (story.comments||[]).forEach(function(comment){
-    if(comment.change_id==null){
-      var stepOrder=comment.step_order;
-      if(lastStepOrder!=null&&stepOrders.indexOf(stepOrder)===-1) stepOrder=lastStepOrder;
-      if(!lostCommentsByStep[stepOrder]) lostCommentsByStep[stepOrder]=[];
-      lostCommentsByStep[stepOrder].push(comment);
-      return;
-    }
-    var key=commentKey(comment.file, comment.change_id);
-    if(!commentsByKey[key]) commentsByKey[key]=[];
-    commentsByKey[key].push(comment);
+  // reply と resolve は comments.json の並び順で指すので、その番号をここで持たせる
+  (story.comments||[]).forEach(function(comment, index){
+    comment.number=index+1;
+    var stepOrder=comment.step_order;
+    if(lastStepOrder!=null&&stepOrders.indexOf(stepOrder)===-1) stepOrder=lastStepOrder;
+    var scope=commentScope(comment);
+    if(scope==='story'){storyComments.push(comment); return;}
+    if(scope==='step'){pushComment(stepCommentsByStep, stepOrder, comment); return;}
+    if(comment.change_id==null){pushComment(lostCommentsByStep, stepOrder, comment); return;}
+    pushComment(commentsByKey, commentKey(comment.file, comment.change_id), comment);
   });
 }
 function renderStepList(){
@@ -1863,6 +1911,13 @@ function renderStepProgress(){
   // 全部が準備中の間は読める数が0なので、数を出しても意味が無い
   if(counts.readableCount===0){label.textContent='';return;}
   label.textContent=isAllRead?'全'+counts.readableCount+'コマを読み終えました':counts.readableCount+'コマ中 '+counts.readCount+'コマを読みました';
+}
+// 解決済みは既定で隠す。ボタンに件数を出すので、隠れていても消えたとは見えない
+function renderResolvedFilter(){
+  var button=document.getElementById('resolvedBtn');
+  var resolvedCount=(story.comments||[]).filter(isResolvedComment).length;
+  button.style.display=resolvedCount>0?'inline-block':'none';
+  button.textContent=showsResolvedComments?'解決済みを隠す':'解決済み'+resolvedCount+'件を出す';
 }
 function renderResume(){
   var box=document.getElementById('resumeMsg');
@@ -1937,9 +1992,14 @@ function lineClass(line, ownsSet, refsSet){
   return kindClass;
 }
 function marker(kind){return kind==='add'?'+':(kind==='del'?'-':' ');}
+function toggleResolved(comment){
+  var nextResolved=!isResolvedComment(comment);
+  fetch('/resolve',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({comment_number:comment.number, resolved:nextResolved})})
+    .then(function(){comment.resolved=nextResolved; render();});
+}
 function renderComment(comment){
   var box=document.createElement('div');
-  box.className='comment';
+  box.className=isResolvedComment(comment)?'comment resolved':'comment';
   var bodyLine=document.createElement('div');
   bodyLine.className='comment-body';
   bodyLine.textContent=comment.body;
@@ -1957,42 +2017,91 @@ function renderComment(comment){
     replyBox.appendChild(replyBody);
     box.appendChild(replyBox);
   });
+  var resolveButton=document.createElement('button');
+  resolveButton.className='comment-resolve';
+  resolveButton.textContent=isResolvedComment(comment)?'未解決に戻す':'解決済みにする';
+  resolveButton.onclick=function(){toggleResolved(comment);};
+  box.appendChild(resolveButton);
   return box;
 }
-function openForm(row, line, file, stepOrder, repo){
-  if(row.nextSibling&&row.nextSibling.className==='comment-form') return;
-  var openedMinimapSignature=minimapSignature;
+// 送ったコメントは番号が要るので、取り直しを待たずに手元のコメント一覧の末尾に足す
+function rememberComment(saved){
+  if(!story.comments) story.comments=[];
+  story.comments.push(saved);
+  saved.number=story.comments.length;
+  return saved;
+}
+// buildPayload が null を返したときは送らずに閉じるだけにする
+function buildCommentForm(placeholder, buildPayload, onSaved){
   var form=document.createElement('div');
   form.className='comment-form';
   var input=document.createElement('input');
-  input.placeholder='この行へのコメントを書く';
+  input.placeholder=placeholder;
   var sendButton=document.createElement('button');
   sendButton.textContent='送信';
   sendButton.onclick=function(){
     var body=input.value.trim();
     if(!body) return;
-    if(minimapSignature!==openedMinimapSignature){
+    var payload=buildPayload(body);
+    if(payload==null){
       form.parentNode.removeChild(form);
-      var msg=document.getElementById('doneMsg');
-      msg.textContent='差分が更新されたためコメント欄を閉じました。もう一度開いて書いてください';
-      msg.style.display='block';
       return;
     }
-    var payload={change_id:line.id, file:file, repo:repo, line:(line.new==null?line.old:line.new), step_order:stepOrder, body:body};
     fetch('/comments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
       .then(function(res){return res.json();})
       .then(function(saved){
-        var key=commentKey(file, line.id);
-        if(!commentsByKey[key]) commentsByKey[key]=[];
-        commentsByKey[key].push(saved);
-        form.parentNode.insertBefore(renderComment(saved), form);
+        onSaved(rememberComment(saved), form);
         form.parentNode.removeChild(form);
       });
   };
   form.appendChild(input);
   form.appendChild(sendButton);
-  row.parentNode.insertBefore(form, row.nextSibling);
-  input.focus();
+  return {form:form, input:input};
+}
+function openForm(row, line, file, stepOrder, repo){
+  if(row.nextSibling&&row.nextSibling.className==='comment-form') return;
+  var openedMinimapSignature=minimapSignature;
+  var formParts=buildCommentForm('この行へのコメントを書く', function(body){
+    if(minimapSignature!==openedMinimapSignature){
+      var msg=document.getElementById('doneMsg');
+      msg.textContent='差分が更新されたためコメント欄を閉じました。もう一度開いて書いてください';
+      msg.style.display='block';
+      return null;
+    }
+    return {scope:'line', change_id:line.id, file:file, repo:repo, line:(line.new==null?line.old:line.new), step_order:stepOrder, body:body};
+  }, function(saved, form){
+    pushComment(commentsByKey, commentKey(file, line.id), saved);
+    form.parentNode.insertBefore(renderComment(saved), form);
+  });
+  row.parentNode.insertBefore(formParts.form, row.nextSibling);
+  formParts.input.focus();
+}
+function openScopeForm(box, scope, stepOrder, placeholder){
+  if(box.querySelector('.comment-form')) return;
+  var formParts=buildCommentForm(placeholder, function(body){
+    return {scope:scope, step_order:(scope==='step'?stepOrder:null), body:body};
+  }, function(saved, form){
+    box.insertBefore(renderComment(saved), form);
+  });
+  box.appendChild(formParts.form);
+  formParts.input.focus();
+}
+// 行に紐づかないコメントの枠。差分より前に置き、ストーリー全体・このコマ・差分の順に細かくしていく
+function renderScopeComments(parent, label, scope, stepOrder, comments){
+  var box=document.createElement('div');
+  box.className='file scope-comments';
+  var heading=document.createElement('div');
+  heading.className='file-head scope-comments-heading';
+  var labelText=document.createElement('span');
+  labelText.textContent=label;
+  var addButton=document.createElement('button');
+  addButton.textContent='コメントを書く';
+  addButton.onclick=function(){openScopeForm(box, scope, stepOrder, label+'を書く');};
+  heading.appendChild(labelText);
+  heading.appendChild(addButton);
+  box.appendChild(heading);
+  shownComments(comments).forEach(function(comment){box.appendChild(renderComment(comment));});
+  parent.appendChild(box);
 }
 var LANGUAGE_BY_EXT={js:'javascript',mjs:'javascript',cjs:'javascript',jsx:'javascript',ts:'typescript',tsx:'typescript',py:'python',rb:'ruby',go:'go',rs:'rust',java:'java',c:'c',h:'c',cpp:'cpp',hpp:'cpp',cs:'csharp',php:'php',pl:'perl',pm:'perl',sh:'bash',bash:'bash',zsh:'bash',json:'json',yml:'yaml',yaml:'yaml',html:'xml',xml:'xml',vue:'xml',css:'css',scss:'scss',sql:'sql',md:'markdown'};
 function languageOf(filePath){
@@ -2176,8 +2285,7 @@ function buildCell(line, ownsSet, refsSet, file, counterpartLine){
 }
 function appendExistingComments(parent, line, file){
   if(!line||line.id==null) return;
-  var existing=commentsByKey[commentKey(file.file, line.id)]||[];
-  existing.forEach(function(comment){parent.appendChild(renderComment(comment));});
+  shownComments(commentsByKey[commentKey(file.file, line.id)]).forEach(function(comment){parent.appendChild(renderComment(comment));});
 }
 function appendLine(parent, line, file, stepOrder, ownsSet, refsSet, counterpartLine){
   var row=buildCell(line, ownsSet, refsSet, file, counterpartLine);
@@ -2649,6 +2757,7 @@ function render(){
   document.getElementById('nextBtn').disabled=!canGoNext();
   renderStepList();
   renderStepProgress();
+  renderResolvedFilter();
   renderResume();
   renderBanner();
   renderOverview();
@@ -2658,13 +2767,16 @@ function render(){
   if(!step) return;
   var ownsSet={}; (step.owns||[]).forEach(function(id){ownsSet[id]=true;});
   var refsSet={}; (step.refs||[]).forEach(function(id){refsSet[id]=true;});
+  var currentStepOrder=stepNumber(step, stepIndex);
+  renderScopeComments(diff, 'ストーリー全体へのコメント', 'story', null, storyComments);
+  renderScopeComments(diff, 'このコマ全体へのコメント', 'step', currentStepOrder, stepCommentsByStep[currentStepOrder]);
   var shownFiles=story.files.filter(function(file){
     return file.lines.some(function(line){return line.id!=null&&(ownsSet[line.id]||refsSet[line.id]);});
   });
   orderedFiles(shownFiles, step, ownsSet).forEach(function(file){
     diff.appendChild(renderFile(file, step, ownsSet, refsSet));
   });
-  var lostComments=lostCommentsByStep[stepNumber(step, stepIndex)]||[];
+  var lostComments=shownComments(lostCommentsByStep[currentStepOrder]);
   if(lostComments.length>0){
     var lostBox=document.createElement('div');
     lostBox.className='file';
@@ -2680,6 +2792,10 @@ function render(){
 }
 document.getElementById('prevBtn').onclick=function(){if(stepIndex>0) goToStep(stepIndex-1);};
 document.getElementById('nextBtn').onclick=function(){if(canGoNext()) goToStep(stepIndex+1);};
+document.getElementById('resolvedBtn').onclick=function(){
+  showsResolvedComments=!showsResolvedComments;
+  render();
+};
 document.getElementById('followBtn').onclick=function(){
   var followBtn=document.getElementById('followBtn');
   var msg=document.getElementById('doneMsg');
@@ -2773,7 +2889,8 @@ function storyFingerprint(minimapPart){
   var overview=story.overview||{};
   var overviewPart=(overview.summary||'')+':'+buildBulletMarkdown(overview.key_changes)+':'+buildBulletMarkdown(overview.risks);
   var comments=story.comments||[];
-  var commentPart=comments.length+'#'+comments.map(function(comment){return (comment.replies||[]).length;}).join(',');
+  // 解決の状態は comments.json が持ち主で、別のタブや skill からも変わるので指紋に入れる
+  var commentPart=comments.length+'#'+comments.map(function(comment){return (comment.replies||[]).length+(isResolvedComment(comment)?'r':'');}).join(',');
   return minimapPart+'@'+story.title+'@'+overviewPart+'@'+stepPart+'@'+commentPart;
 }
 var storySignature='';
@@ -2955,9 +3072,14 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 .reply{margin-top:8px;padding-top:8px;border-top:1px solid var(--border-soft)}
 .reply-author{display:inline-block;font-size:11px;font-weight:700;color:var(--accent);margin-bottom:3px}
 .reply-body{white-space:normal;line-height:1.6}
+.comment.resolved{background:var(--surface-soft);border-left-color:var(--text-soft);opacity:.7}
+.comment-resolve{margin-top:6px;padding:2px 9px;font-size:11px;border-radius:6px}
 .comment-form{margin:4px 12px 8px 46px;display:flex;gap:8px}
 .comment-form input{flex:1;padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-family:inherit;font-size:13px}
-.lost-comments-heading{font-size:13px;font-weight:600;color:var(--text-soft)}
+.lost-comments-heading,.scope-comments-heading{font-size:13px;font-weight:600;color:var(--text-soft)}
+.scope-comments-heading button{margin-left:auto;font-size:12px;padding:4px 10px}
+.scope-comments .comment{margin:8px 16px}
+.scope-comments .comment-form{margin:8px 16px}
 @media (prefers-color-scheme: dark){
   :root{
     --text-main:#e6edf3;
@@ -3019,6 +3141,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 <button id='splitBtn' class='view-toggle-btn active'>左右並列</button>
 </div>
 <span class='spacer'></span>
+<button id='resolvedBtn' style='display:none'></button>
 <button id='followBtn'>差分を取り込む</button>
 <button id='doneBtn' class='done-btn'>レビュー完了</button>
 <button id='closeBtn'>終了</button>
@@ -3045,7 +3168,7 @@ function main() {
   const command = args[0];
   const targetDir = args[1];
   if (!command || !targetDir) {
-    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] [--with-draft] | node storiff.js fill <dir> | node storiff.js check <dir> | node storiff.js reply <dir> <コメント番号> <本文> | node storiff.js serve <dir> [--port N] [--host H]");
+    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] [--with-draft] | node storiff.js fill <dir> | node storiff.js check <dir> | node storiff.js reply <dir> <コメント番号> <本文> [--keep-resolved] | node storiff.js serve <dir> [--port N] [--host H]");
     process.exit(1);
   }
   if (command === "check") {
@@ -3121,19 +3244,21 @@ function main() {
     return;
   }
   if (command === "reply") {
-    const commentNumber = parseInt(args[2], 10);
-    const body = args.slice(3).join(" ");
+    const keepsResolved = args.includes("--keep-resolved");
+    const replyArgs = args.slice(2).filter((arg) => arg !== "--keep-resolved");
+    const commentNumber = parseInt(replyArgs[0], 10);
+    const body = replyArgs.slice(1).join(" ");
     if (!commentNumber || !body) {
-      console.log("使い方: node storiff.js reply <dir> <コメント番号> <本文>");
+      console.log("使い方: node storiff.js reply <dir> <コメント番号> <本文> [--keep-resolved]");
       process.exit(1);
     }
     try {
-      appendReply(targetDir, commentNumber, body);
+      appendReply(targetDir, commentNumber, body, keepsResolved);
     } catch (error) {
       console.log(error.message);
       process.exit(1);
     }
-    console.log("reply: コメント" + commentNumber + " に返信を追記しました");
+    console.log("reply: コメント" + commentNumber + " に返信を追記しました" + (keepsResolved ? "(解決済みのまま)" : ""));
     return;
   }
   if (command === "prep") {
@@ -3214,6 +3339,10 @@ function main() {
 if (require.main === module) main();
 
 module.exports.buildFileDiffText = buildFileDiffText;
+module.exports.commentScope = commentScope;
+module.exports.appendComment = appendComment;
+module.exports.appendReply = appendReply;
+module.exports.setCommentResolved = setCommentResolved;
 module.exports.buildAskPrompt = buildAskPrompt;
 module.exports.askHaiku = askHaiku;
 module.exports.findDefinitionRegexps = findDefinitionRegexps;
