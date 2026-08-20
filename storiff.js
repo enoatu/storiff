@@ -1231,6 +1231,22 @@ function buildDiagramValidation(steps) {
   return { problems, oversizedDiagramSteps };
 }
 
+function readProgress(targetDir) {
+  return readJson(path.join(targetDir, "progress.json"), null);
+}
+
+// 追従では既存ステップの order を振り直さず末尾に足すだけなので、題より order のほうが動かない
+function writeProgress(targetDir, body) {
+  const readStepOrders = Array.isArray(body.read_step_orders) ? body.read_step_orders.filter(Number.isInteger) : [];
+  const progress = {
+    at: new Date().toISOString(),
+    current_step_order: Number.isInteger(body.current_step_order) ? body.current_step_order : null,
+    read_step_orders: [...new Set(readStepOrders)].sort((left, right) => left - right),
+  };
+  writeFileAtomic(path.join(targetDir, "progress.json"), JSON.stringify(progress, null, 2));
+  return progress;
+}
+
 function buildStory(targetDir) {
   if (!fs.existsSync(path.join(targetDir, "changes.json"))) throw new Error("changes.json がありません: 先に prep を実行してください");
   const changes = readChanges(targetDir);
@@ -1245,6 +1261,7 @@ function buildStory(targetDir) {
     steps: validation.resolvedSteps,
     validation: { ok: validation.ok, missing: validation.missing, duplicated: validation.duplicated, unknown_files: validation.unknown_files },
     comments,
+    progress: readProgress(targetDir),
   };
 }
 
@@ -1547,6 +1564,11 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
         }
         return;
       }
+      if (request.method === "POST" && request.url === "/progress") {
+        const body = await readBody(request);
+        sendJson(response, 200, writeProgress(targetDir, body));
+        return;
+      }
       if (request.method === "POST" && request.url === "/done") {
         fs.writeFileSync(path.join(targetDir, "done.flag"), new Date().toISOString());
         sendJson(response, 200, { done: true });
@@ -1698,9 +1720,12 @@ function startServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
 
 const VIEWER_SCRIPT = `
 var story=null, stepIndex=0, commentsByKey={}, lostCommentsByStep={};
+var readStepOrders={}, resumeStepOrder=null, progressSaveTimer=null;
 var viewMode='split';
 var CONTEXT_LINES=3;
 var FOLLOW_COOLDOWN_MSEC=5000;
+// 読み飛ばしで連打されても書き込みが増えないよう、最後の移動からこれだけ待ってまとめて送る
+var PROGRESS_SAVE_DELAY_MSEC=1500;
 // 単語単位で色を分けてよいと判断する、共通するトークンの最低の割合
 var WORD_DIFF_SIMILARITY_MIN=0.75;
 var NARRATION_PENDING_TEXT='説明文をいま書いています。書けたコマから自動で出ます';
@@ -1749,6 +1774,45 @@ function isNarrationPending(step){
   if(step==null||String(step.narration||'').trim()!=='') return false;
   return !FOLLOW_STEP_TITLE_PATTERN.test(step.title||'');
 }
+// 準備中のコマは説明文がまだ無く読みようがないので、読んだ数にも読むべき数にも入れない
+function countReadSteps(){
+  var stepOrders=(story.steps||[]).map(function(step, index){return isNarrationPending(step)?null:stepNumber(step, index);})
+    .filter(function(stepOrder){return stepOrder!=null;});
+  return {
+    readCount:stepOrders.filter(function(stepOrder){return readStepOrders[stepOrder]===true;}).length,
+    readableCount:stepOrders.length,
+  };
+}
+function markCurrentStepRead(){
+  var step=story.steps[stepIndex];
+  if(step==null||isNarrationPending(step)) return;
+  readStepOrders[stepNumber(step, stepIndex)]=true;
+}
+// 覚えた order のコマが無くなっていたら、その手前で一番近いコマに戻す
+function findStepIndexByOrder(targetOrder){
+  var nearestIndex=-1;
+  (story.steps||[]).forEach(function(step, index){
+    if(stepNumber(step, index)<=targetOrder) nearestIndex=index;
+  });
+  return nearestIndex<0?0:nearestIndex;
+}
+function loadProgress(){
+  var progress=story.progress;
+  if(progress==null) return;
+  (progress.read_step_orders||[]).forEach(function(stepOrder){readStepOrders[stepOrder]=true;});
+  if(progress.current_step_order>1) resumeStepOrder=progress.current_step_order;
+}
+function saveProgressSoon(){
+  if(progressSaveTimer!=null) clearTimeout(progressSaveTimer);
+  progressSaveTimer=setTimeout(function(){
+    progressSaveTimer=null;
+    var step=story.steps[stepIndex];
+    fetch('/progress',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      current_step_order:step?stepNumber(step, stepIndex):null,
+      read_step_orders:Object.keys(readStepOrders).map(Number),
+    })}).catch(function(){});
+  }, PROGRESS_SAVE_DELAY_MSEC);
+}
 function indexComments(){
   commentsByKey={};
   lostCommentsByStep={};
@@ -1772,7 +1836,7 @@ function renderStepList(){
   list.innerHTML='';
   story.steps.forEach(function(step, index){
     var item=document.createElement('button');
-    item.className='step-item'+(index===stepIndex?' active':'');
+    item.className='step-item'+(index===stepIndex?' active':'')+(readStepOrders[stepNumber(step, index)]===true?' read':'');
     var numberLabel=document.createElement('span');
     numberLabel.className='step-num';
     numberLabel.textContent=index+1;
@@ -1790,6 +1854,30 @@ function renderStepList(){
     item.onclick=function(){goToStep(index);};
     list.appendChild(item);
   });
+}
+function renderStepProgress(){
+  var counts=countReadSteps();
+  var label=document.getElementById('stepProgress');
+  var isAllRead=counts.readCount>=counts.readableCount;
+  label.className=isAllRead?'step-progress done':'step-progress';
+  // 全部が準備中の間は読める数が0なので、数を出しても意味が無い
+  if(counts.readableCount===0){label.textContent='';return;}
+  label.textContent=isAllRead?'全'+counts.readableCount+'コマを読み終えました':counts.readableCount+'コマ中 '+counts.readCount+'コマを読みました';
+}
+function renderResume(){
+  var box=document.getElementById('resumeMsg');
+  box.innerHTML='';
+  if(resumeStepOrder==null){box.style.display='none';return;}
+  var text=document.createElement('span');
+  text.className='resume-text';
+  text.textContent='前回は'+resumeStepOrder+'コマ目まで読みました';
+  var resumeBtn=document.createElement('button');
+  resumeBtn.id='resumeBtn';
+  resumeBtn.textContent='続きから読む';
+  resumeBtn.onclick=function(){goToStep(findStepIndexByOrder(resumeStepOrder));};
+  box.appendChild(text);
+  box.appendChild(resumeBtn);
+  box.style.display='flex';
 }
 function renderBanner(){
   var banner=document.getElementById('banner');
@@ -2546,9 +2634,10 @@ function minimapJump(clientY){
 }
 
 function canGoNext(){return stepIndex<story.steps.length-1;}
-function goToStep(nextIndex){stepIndex=nextIndex;render();window.scrollTo(0,0);}
+function goToStep(nextIndex){resumeStepOrder=null;stepIndex=nextIndex;render();saveProgressSoon();window.scrollTo(0,0);}
 function render(){
   var step=story.steps[stepIndex];
+  markCurrentStepRead();
   document.getElementById('storyTitle').textContent=story.title||'storiff';
   document.getElementById('stepTitle').textContent=step?step.title:'ステップがありません';
   var narrationBox=document.getElementById('narration');
@@ -2559,6 +2648,8 @@ function render(){
   document.getElementById('prevBtn').disabled=stepIndex<=0;
   document.getElementById('nextBtn').disabled=!canGoNext();
   renderStepList();
+  renderStepProgress();
+  renderResume();
   renderBanner();
   renderOverview();
   renderDiagram(document.getElementById('diagram'), step?step.diagram:null);
@@ -2689,9 +2780,11 @@ var storySignature='';
 var minimapSignature='';
 fetch('/story.json').then(function(res){return res.json();}).then(function(data){
   story=data; indexComments();
+  loadProgress();
   minimapSignature=minimapFingerprint();
   storySignature=storyFingerprint(minimapSignature);
   render();
+  saveProgressSoon();
 });
 // AI の返信や追従による差分・ステップの変化を拾うため story.json を定期取得し、変化があれば再描画する
 setInterval(function(){
@@ -2747,7 +2840,9 @@ body{
   background:var(--surface);border-right:1px solid var(--border);
   overflow-y:auto;padding:20px 16px;
 }
-.sidebar-title{font-size:15px;font-weight:700;line-height:1.4;margin:0 4px 16px;word-break:break-word}
+.sidebar-title{font-size:15px;font-weight:700;line-height:1.4;margin:0 4px 8px;word-break:break-word}
+.step-progress{font-size:12px;color:var(--text-soft);margin:0 4px 14px}
+.step-progress.done{color:#1a7f37;font-weight:700}
 .step-list{display:flex;flex-direction:column;gap:4px}
 .step-item{
   display:flex;align-items:flex-start;gap:10px;width:100%;text-align:left;
@@ -2760,6 +2855,7 @@ body{
   flex:none;width:22px;height:22px;border-radius:50%;background:var(--surface-soft);
   color:var(--text-soft);font-size:12px;display:flex;align-items:center;justify-content:center;
 }
+.step-item.read .step-num{background:#d7f0df;color:#1a7f37}
 .step-item.active .step-num{background:var(--accent);color:#fff}
 .step-item-title{flex:1;padding-top:1px;word-break:break-word}
 .step-pending{flex:none;padding-top:2px;font-size:11px;font-weight:400;color:var(--text-soft);white-space:nowrap}
@@ -2803,6 +2899,8 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 .content{padding:24px 32px 80px}
 .banner-box{background:#fff8e6;border:1px solid #f0d68a;color:#7a5b00;padding:12px 16px;border-radius:10px;margin-bottom:16px}
 .done-msg{background:#e6f6ec;border:1px solid #a3d9b1;color:#1a7f37;padding:12px 16px;border-radius:10px;margin-bottom:16px}
+.resume-msg{align-items:center;gap:12px;background:var(--accent-soft);border:1px solid var(--accent);padding:12px 16px;border-radius:10px;margin-bottom:16px}
+.resume-text{flex:1}
 .overview{background:var(--surface);border:1px solid var(--border);border-radius:12px;margin-bottom:20px;padding:16px 18px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
 .overview-head{font-size:15px;font-weight:700;margin-bottom:8px}
 .overview-label{font-size:12px;font-weight:700;color:var(--text-soft);margin:12px 0 4px}
@@ -2874,6 +2972,8 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
   .done-btn:hover:not(:disabled){background:#5577ff}
   .banner-box{background:#2b2410;border-color:#5a4a1a;color:#e3c56b}
   .done-msg{background:#132a1a;border-color:#2f6b42;color:#5cc47f}
+  .step-progress.done{color:#3fb950}
+  .step-item.read .step-num{background:#173a24;color:#3fb950}
   .file-head .status{background:#2a2f38}
   .file-note{background:#0f141b}
   .add{background:#12261a}
@@ -2905,6 +3005,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 </style></head><body>
 <div class='sidebar'>
 <h1 id='storyTitle' class='sidebar-title'></h1>
+<div id='stepProgress' class='step-progress'></div>
 <div id='stepList' class='step-list'></div>
 </div>
 <div class='main'>
@@ -2926,6 +3027,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 <p id='narration' class='narration'></p>
 </div></header>
 <div class='content'>
+<div id='resumeMsg' class='resume-msg' style='display:none'></div>
 <div id='doneMsg' class='done-msg' style='display:none'>コメントを送信しました。AIの返信がまもなく各コメントの下に表示されます</div>
 <div id='banner'></div>
 <div id='overview' class='overview' style='display:none'></div>
@@ -3135,6 +3237,8 @@ module.exports.fetchPullRequestOrNull = fetchPullRequestOrNull;
 module.exports.resolveSteps = resolveSteps;
 module.exports.buildValidation = buildValidation;
 module.exports.buildStory = buildStory;
+module.exports.readProgress = readProgress;
+module.exports.writeProgress = writeProgress;
 module.exports.buildUnassignedFileLines = buildUnassignedFileLines;
 module.exports.buildOverviewIssues = buildOverviewIssues;
 module.exports.parseDiagram = parseDiagram;

@@ -25,7 +25,7 @@ storiff.js(Node単一ファイル)とビューア、skill が共有する契約�
 - `node storiff.js serve <dir> [--port N] [--host H] [--session-id ID]` : ビューアを配信する常駐プロセスを裏で立ち上げ、URLだけすぐ返す。裏のプロセスは changes.json と steps.json を読み、`<dir>/close.flag` で終了する(`done.flag` では止まらない)。ログは `<dir>/serve.log`、起動情報は `<dir>/serve.json`(pid・port・host・url・session_id・started_at)に書く。同じ dir でもう一度実行すると、serve.json の pid が生きていて `/health` に応答すれば新しく起動せず既存のビューアに接続する。このとき `--session-id` を渡すと serve.json の session_id を渡した値に更新する。`--daemon` は裏のプロセス自身が使う内部フラグ。`--session-id` を渡すと、行コメントに haiku がその場で返信する。バインド先は既定 127.0.0.1、`--host 0.0.0.0` で外部からホスト名で見られる
 - バインド先は `~/.storiff/config.json` の `host` でも指定できる(`{"host": "0.0.0.0"}`)。CLI の `--host` が優先
 
-`changes.json` `changes.txt` `files.txt` `hints.txt` `context.txt` `steps.json` `comments.json` `follow.json` `serve.json` はすべて一時ファイルに書いてから同じディレクトリ内で差し替える。書き込みの途中で別プロセスが読みにいっても、壊れた内容を掴むことはない。コミット本文や PR の本文が入るので、ファイルは 0600、`<dir>` は 0700 で作る
+`changes.json` `changes.txt` `files.txt` `hints.txt` `context.txt` `steps.json` `comments.json` `follow.json` `serve.json` `progress.json` はすべて一時ファイルに書いてから同じディレクトリ内で差し替える。書き込みの途中で別プロセスが読みにいっても、壊れた内容を掴むことはない。コミット本文や PR の本文が入るので、ファイルは 0600、`<dir>` は 0700 で作る
 
 依存は Node 組み込みのみ(http, fs, path, child_process, os)。Node 20+。`--session-id` を渡したときの行コメント返信(askHaiku)と `fill` だけは外部の `claude` コマンドを子プロセスで呼ぶ。context.txt を集めるときは `git`、`--with-remote` を付けたときだけ `gh` も子プロセスで呼ぶ。
 
@@ -354,11 +354,21 @@ CLI から直接 prep を実行する経路と、ビューアの「差分を取�
   "change_ids": [ ... ],
   "steps": [ ... ],
   "validation": {"ok": true, "missing": [], "duplicated": [], "unknown_files": []},
-  "comments": [ ... ]
+  "comments": [ ... ],
+  "progress": {"at": "...", "current_step_order": 3, "read_step_orders": [1, 2, 3]}
 }
 ```
 - serve は owns の和集合が change_ids と一致するか検算し validation に入れる。不一致でも配信はする
 - overview と steps の中身は steps.json のまま渡る。overview が steps.json に無ければ null
+- progress は progress.json のまま渡る。まだ読んでいない `<dir>` では null
+
+## 読んだ位置(progress.json)
+
+大きい差分は1日で読み切れないので、どのコマまで読んだかを `<dir>/progress.json` に残す。サーバ側に置くので、別のブラウザや別の端末から開いても続きから読める。
+
+- `current_step_order` 最後にいたコマの order。`read_step_orders` 読み終えたコマの order の昇順の配列。整数でない値は捨てる
+- 覚えるのは order だけ。追従は既存ステップの order を振り直さず末尾に「修正N回目」を足すだけなので、題や並び順より order が動かない
+- ビューアはコマを移動するたびに送らず、最後の移動から PROGRESS_SAVE_DELAY_MSEC(1500ミリ秒)待ってまとめて POST /progress する。読み飛ばしで連打されても書き込みは1回になる
 
 ## HTTP API(serve)
 | メソッド | パス | 内容 |
@@ -370,6 +380,7 @@ CLI から直接 prep を実行する経路と、ビューアの「差分を取�
 | POST | /done | `<dir>/done.flag` を書く。skill はこれを合図に返信する。serve は止めない |
 | POST | /close | `<dir>/close.flag` を書く。serve はこれで終了する |
 | POST | /follow | 追従の prep を子プロセスで実行する。すでに実行中なら 409 を返す |
+| POST | /progress | 読んだ位置を `<dir>/progress.json` に書く。body は `{"current_step_order": 3, "read_step_orders": [1, 2, 3]}` |
 
 POST /comments の body
 ```json
@@ -390,6 +401,10 @@ comments.json は上記に `replies` と `at`(ISO文字列)を足した配列。
 - 行クリックでコメント欄。送信で POST /comments。AIの返信は各コメントの下にスレッドで積む。コメント欄を開いた後に追従が入って差分が変わっていたら、送信時に欄を閉じて開き直すよう伝える
 - 固定ヘッダーに「差分を取り込む」ボタンがある。押すと POST /follow で追従の prep を走らせ、押したことと取り込みが始まったことをメッセージで示す。押した直後には描き直さず、定期取得が変化を拾うのに任せる。追従が動いている間は次の押下がサーバ側で断られる
 - /story.json を3秒ごとに取得し、差分やステップの題や説明文や図やコメントや返信が変わったときだけ再描画する。ミニマップも組み直す。見ているステップ位置とスクロール位置は保つ。コメント欄を開いている間は再描画しない
+- 開いたときは記録があっても必ず1コマ目から始め、前回のコマには飛ばさない。代わりに差分の手前に `前回は3コマ目まで読みました` と「続きから読む」ボタンを出し、押したときだけ移る。ボタンは一度でもコマを移動すると消える
+- 記録した order のコマが無くなっていたら、その手前で一番近いコマに移る
+- 目次では読み終えたコマの番号を緑にし、サイドバーの上に `10コマ中 3コマを読みました` と出す。全部読み終えると `全10コマを読み終えました` に変わる。準備中のコマは説明文がまだ無いので、読んだ数にも読むべき数にも入れない
+- 読んだ記録はビューアが持ち続けるので、3秒ごとの再描画でも追従でコマが増えても消えない
 - 「レビュー完了」で POST /done、「終了」で POST /close
 - validation.ok が false なら missing/duplicated/unknown_files を警告バナー表示
 - add=緑、del=赤の配色で、OSの設定に合わせてダークモードにも切り替わる
