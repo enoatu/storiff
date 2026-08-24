@@ -12,7 +12,7 @@ const FOLLOW_STEP_TITLE_PATTERN = /^修正\d+回目$/;
 const CHANGED_LINES_PER_STEP_GUIDE = 80;
 
 // 区切りの下書きで、隣とまとめてよい差分のかたまりの変更行数。これを超えるかたまりは単独で1stepにする
-const DRAFT_HUNK_LINES_MAX = 10;
+const DRAFT_HUNK_LINES_MAX = 20;
 
 const CLAUDE_TIMEOUT_MSEC = 180000;
 
@@ -21,6 +21,10 @@ const CLAUDE_STDOUT_BYTE_MAX = 1024 * 1024 * 8;
 
 // 説明文を埋めるときに同時に走らせる claude の数。増やすほど1つあたりが遅くなり、先頭のコマが読めるまでが遅れる
 const FILL_PARALLEL_COUNT_MAX = 4;
+
+// 全体像の目安。ここを超えると読み手が最初の枠で止まってしまう
+const OVERVIEW_LIST_LENGTH_GUIDE = 400;
+const OVERVIEW_SUMMARY_LENGTH_GUIDE = 200;
 
 // 説明文を書く子プロセスに許す道具。材料を読むだけでよく、steps.json のあるディレクトリに書かせない
 const FILL_ALLOWED_TOOLS = "Read,Glob,Grep";
@@ -1124,6 +1128,11 @@ function countFilledItems(values) {
   return (Array.isArray(values) ? values : []).filter((value) => String(value).trim() !== "").length;
 }
 
+function countItemsLength(items) {
+  if (!Array.isArray(items)) return 0;
+  return items.reduce((total, item) => total + (typeof item === "string" ? narrationLength(item) : 0), 0);
+}
+
 // 文章の良し悪しは機械では決められないので ng にはせず参考として返す
 function buildOverviewIssues(overview) {
   if (overview == null) return [];
@@ -1134,6 +1143,14 @@ function buildOverviewIssues(overview) {
   else if (countFilledItems(overview.key_changes) === 0) issues.push("key_changes が0件です");
   if (overview.risks != null && !Array.isArray(overview.risks)) issues.push("risks が配列になっていません");
   else if (countFilledItems(overview.risks) === 0) issues.push("risks が0件です");
+  const summaryLength = typeof overview.summary === "string" ? narrationLength(overview.summary) : 0;
+  if (summaryLength > OVERVIEW_SUMMARY_LENGTH_GUIDE) {
+    issues.push("summary が" + summaryLength + "文字です。目安は" + OVERVIEW_SUMMARY_LENGTH_GUIDE + "文字");
+  }
+  const listLength = countItemsLength(overview.key_changes) + countItemsLength(overview.risks);
+  if (listLength > OVERVIEW_LIST_LENGTH_GUIDE) {
+    issues.push("key_changes と risks が合わせて" + listLength + "文字です。目安は" + OVERVIEW_LIST_LENGTH_GUIDE + "文字");
+  }
   return issues;
 }
 
@@ -1479,7 +1496,11 @@ function buildHaikuRequest(targetDir, comment) {
 }
 
 // 担当の差分はプロンプトに直接入れる。パスだけ渡すと子プロセスが毎回 Grep で探し、changes.txt 全体を読みにいく
-function buildFillPrompt(targetDir, step, stepNumber, stepCount, diffText) {
+function narrationLength(text) {
+  return Array.from(text).length;
+}
+
+function buildFillPrompt(targetDir, step, stepNumber, stepCount, diffText, tooLongNarration) {
   return [
     "コード差分のレビューを紙芝居で見せます。その1コマ分の説明文を書いてください",
     "",
@@ -1497,6 +1518,10 @@ function buildFillPrompt(targetDir, step, stepNumber, stepCount, diffText) {
     "",
     "書き方",
     "- " + FILL_NARRATION_LENGTH_GUIDE + "文字以内。長い説明は読み手に分かった気だけを残すので短く書く",
+    tooLongNarration == null
+      ? ""
+      : "前の答えは" + narrationLength(tooLongNarration) + "文字で長すぎました。何をしたかを削り、なぜそうしたかを残して"
+        + FILL_NARRATION_LENGTH_GUIDE + "文字以内に書き直してください\n前の答え\n" + tooLongNarration,
     "- 何をしたかは1文か2文まで。差分を読めば分かることを言いかえない",
     "- 残りはなぜそうしたかに使う。削るのは何をしたかの側で、なぜは残す",
     "- 材料から読み取れないことは書かない。推測で補わない",
@@ -1541,16 +1566,32 @@ function runFill(targetDir, onDone) {
     const fillTarget = fillTargets[startedCount];
     startedCount++;
     const diffText = buildChangesText(changes.files, fillTarget.ownedIds);
-    const prompt = buildFillPrompt(targetDir, fillTarget.step, fillTarget.stepNumber, stepList.length, diffText);
-    const claudeArgs = ["-p", "--no-session-persistence", "--add-dir", targetDir, "--allowedTools", FILL_ALLOWED_TOOLS, "--output-format", "json", prompt];
-    runClaude(cwd, claudeArgs, (narration) => {
+    const askClaude = (tooLongNarration, onNarration) => {
+      const prompt = buildFillPrompt(targetDir, fillTarget.step, fillTarget.stepNumber, stepList.length, diffText, tooLongNarration);
+      const claudeArgs = ["-p", "--no-session-persistence", "--add-dir", targetDir, "--allowedTools", FILL_ALLOWED_TOOLS, "--output-format", "json", prompt];
+      runClaude(cwd, claudeArgs, onNarration);
+    };
+    const useNarration = (narration) => {
       finishedCount++;
-      if (narration.trim() !== "" && writeNarration(targetDir, fillTarget.step, narration.trim())) {
+      if (narration !== "" && writeNarration(targetDir, fillTarget.step, narration)) {
         filledCount++;
         console.log("fill: " + filledCount + "/" + fillTargets.length + " step" + fillTarget.stepNumber + " " + (fillTarget.step.title || ""));
       }
       if (finishedCount === fillTargets.length) finish();
       startNext();
+    };
+    // 目安を指示するだけでは守られないので、長さを数えて1回だけ書き直させる。2回目も長ければそのまま使う
+    askClaude(null, (narration) => {
+      const text = narration.trim();
+      if (text === "" || narrationLength(text) <= FILL_NARRATION_LENGTH_GUIDE) {
+        useNarration(text);
+        return;
+      }
+      console.log("fill: step" + fillTarget.stepNumber + " が" + narrationLength(text) + "文字だったので書き直させます");
+      askClaude(text, (retried) => {
+        const retriedText = retried.trim();
+        useNarration(retriedText === "" ? text : retriedText);
+      });
     });
   };
   for (let slot = 0; slot < FILL_PARALLEL_COUNT_MAX; slot++) startNext();
@@ -3451,6 +3492,7 @@ module.exports.runPrep = runPrep;
 module.exports.parseDiff = parseDiff;
 module.exports.buildDraftSteps = buildDraftSteps;
 module.exports.buildFillPrompt = buildFillPrompt;
+module.exports.DRAFT_HUNK_LINES_MAX = DRAFT_HUNK_LINES_MAX;
 module.exports.runFill = runFill;
 module.exports.buildCommitRange = buildCommitRange;
 module.exports.collectIssueNumbers = collectIssueNumbers;
