@@ -2038,15 +2038,6 @@ function isNarrationPending(step){
   if(step==null||String(step.narration||'').trim()!=='') return false;
   return !FOLLOW_STEP_TITLE_PATTERN.test(step.title||'');
 }
-// 準備中のコマは説明文がまだ無く読みようがないので、読んだ数にも読むべき数にも入れない
-function countReadSteps(){
-  var stepOrders=(story.steps||[]).map(function(step, index){return isNarrationPending(step)?null:stepNumber(step, index);})
-    .filter(function(stepOrder){return stepOrder!=null;});
-  return {
-    readCount:stepOrders.filter(function(stepOrder){return readStepOrders[stepOrder]===true;}).length,
-    readableCount:stepOrders.length,
-  };
-}
 function markCurrentStepRead(){
   var step=story.steps[stepIndex];
   if(step==null||isNarrationPending(step)) return;
@@ -2131,15 +2122,6 @@ function renderStepList(){
     item.onclick=function(){goToStep(index);};
     list.appendChild(item);
   });
-}
-function renderStepProgress(){
-  var counts=countReadSteps();
-  var label=document.getElementById('stepProgress');
-  var isAllRead=counts.readCount>=counts.readableCount;
-  label.className=isAllRead?'step-progress done':'step-progress';
-  // 全部が準備中の間は読める数が0なので、数を出しても意味が無い
-  if(counts.readableCount===0){label.textContent='';return;}
-  label.textContent=isAllRead?'全'+counts.readableCount+'コマを読み終えました':counts.readableCount+'コマ中 '+counts.readCount+'コマを読みました';
 }
 // 解決済みは既定で隠す。ボタンに件数を出すので、隠れていても消えたとは見えない
 function renderResolvedFilter(){
@@ -2338,9 +2320,10 @@ function openScopeForm(box, scope, stepOrder, placeholder){
   formParts.input.focus();
 }
 // 行に紐づかないコメントの枠。差分より前に置き、ストーリー全体・このコマ・差分の順に細かくしていく
-function renderScopeComments(parent, label, scope, stepOrder, comments){
+function buildScopeCommentsBox(parent, label, scope, stepOrder){
   var box=document.createElement('div');
   box.className='file scope-comments';
+  box.dataset.scope=scope;
   var heading=document.createElement('div');
   heading.className='file-head scope-comments-heading';
   var labelText=document.createElement('span');
@@ -2351,8 +2334,27 @@ function renderScopeComments(parent, label, scope, stepOrder, comments){
   heading.appendChild(labelText);
   heading.appendChild(addButton);
   box.appendChild(heading);
-  shownComments(comments).forEach(function(comment){box.appendChild(renderComment(comment));});
   parent.appendChild(box);
+  return box;
+}
+// 空の枠を差分の手前に出すと、開いた直後に差分がその分だけ下へ押し出される。1件も無いときは枠を作らない
+function renderScopeComments(parent, label, scope, stepOrder, comments){
+  var shown=shownComments(comments);
+  if(shown.length===0) return;
+  var box=buildScopeCommentsBox(parent, label, scope, stepOrder);
+  shown.forEach(function(comment){box.appendChild(renderComment(comment));});
+}
+// 1件も無いコマでも書けるように、枠が無ければ差分の先頭に作ってから開く
+function openScopeCommentForm(scope, label){
+  var diff=document.getElementById('diff');
+  var stepOrder=scope==='step'?stepNumber(story.steps[stepIndex], stepIndex):null;
+  var box=diff.querySelector('.scope-comments[data-scope=\"'+scope+'\"]');
+  if(box==null){
+    box=buildScopeCommentsBox(diff, label, scope, stepOrder);
+    diff.insertBefore(box, diff.firstChild);
+  }
+  openScopeForm(box, scope, stepOrder, label+'を書く');
+  box.scrollIntoView({block:'nearest'});
 }
 var LANGUAGE_BY_EXT={js:'javascript',mjs:'javascript',cjs:'javascript',jsx:'javascript',ts:'typescript',tsx:'typescript',py:'python',rb:'ruby',go:'go',rs:'rust',java:'java',c:'c',h:'c',cpp:'cpp',hpp:'cpp',cs:'csharp',php:'php',pl:'perl',pm:'perl',sh:'bash',bash:'bash',zsh:'bash',json:'json',yml:'yaml',yaml:'yaml',html:'xml',xml:'xml',vue:'xml',css:'css',scss:'scss',sql:'sql',md:'markdown'};
 function languageOf(filePath){
@@ -3007,7 +3009,6 @@ function render(){
   document.getElementById('prevBtn').disabled=stepIndex<=0;
   document.getElementById('nextBtn').disabled=!canGoNext();
   renderStepList();
-  renderStepProgress();
   renderResolvedFilter();
   renderResume();
   renderBanner();
@@ -3044,6 +3045,12 @@ function render(){
 }
 document.getElementById('prevBtn').onclick=function(){if(stepIndex>0) goToStep(stepIndex-1);};
 document.getElementById('nextBtn').onclick=function(){if(canGoNext()) goToStep(stepIndex+1);};
+document.getElementById('storyCommentBtn').onclick=function(){
+  openScopeCommentForm('story', 'ストーリー全体へのコメント');
+};
+document.getElementById('stepCommentBtn').onclick=function(){
+  openScopeCommentForm('step', 'このコマ全体へのコメント');
+};
 document.getElementById('resolvedBtn').onclick=function(){
   showsResolvedComments=!showsResolvedComments;
   render();
@@ -3229,8 +3236,6 @@ body{
   overflow-y:auto;padding:20px 16px;
 }
 .sidebar-title{font-size:15px;font-weight:700;line-height:1.4;margin:0 4px 8px;word-break:break-word}
-.step-progress{font-size:12px;color:var(--text-soft);margin:0 4px 14px}
-.step-progress.done{color:#1a7f37;font-weight:700}
 .step-list{display:flex;flex-direction:column;gap:4px}
 .step-item{
   display:flex;align-items:flex-start;gap:10px;width:100%;text-align:left;
@@ -3371,8 +3376,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
   .step-risks{background:#2b2410;border-color:#5a4a1a;color:#e3c56b}
   .comment-line-lost{color:#e3c56b}
   .done-msg{background:#132a1a;border-color:#2f6b42;color:#5cc47f}
-  .step-progress.done{color:#3fb950}
-  .step-item.read .step-num{background:#173a24;color:#3fb950}
+    .step-item.read .step-num{background:#173a24;color:#3fb950}
   .file-head .status{background:#2a2f38}
   .file-note{background:#0f141b}
   .add{background:#12261a}
@@ -3404,7 +3408,6 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 </style></head><body>
 <div class='sidebar'>
 <h1 id='storyTitle' class='sidebar-title'></h1>
-<div id='stepProgress' class='step-progress'></div>
 <div id='stepList' class='step-list'></div>
 </div>
 <div class='main'>
@@ -3418,6 +3421,8 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 <button id='splitBtn' class='view-toggle-btn active'>左右並列</button>
 </div>
 <span class='spacer'></span>
+<button id='storyCommentBtn'>全体にコメント</button>
+<button id='stepCommentBtn'>コマにコメント</button>
 <button id='resolvedBtn' style='display:none'></button>
 <button id='followBtn'>差分を取り込む</button>
 <button id='rebuildBtn'>作り直す</button>
