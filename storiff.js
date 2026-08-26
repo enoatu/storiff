@@ -11,8 +11,9 @@ const FOLLOW_STEP_TITLE_PATTERN = /^修正\d+回目$/;
 // 1stepがおおよそ1時間の作業に収まる目安の変更行数。これを超えるstepは分割の候補
 const CHANGED_LINES_PER_STEP_GUIDE = 80;
 
-// 区切りの下書きで、隣とまとめてよい差分のかたまりの変更行数。これを超えるかたまりは単独で1stepにする
-const DRAFT_HUNK_LINES_MAX = 20;
+// 区切りの下書きが紙芝居として読み切れるように目指すステップ数の下限と上限
+const DRAFT_STEP_COUNT_MIN = 3;
+const DRAFT_STEP_COUNT_MAX = 10;
 
 const CLAUDE_TIMEOUT_MSEC = 180000;
 
@@ -793,37 +794,84 @@ function buildStep(order, title, ids) {
   return { order, title, narration: "", owns: foldIdsToRanges(ids), refs: [] };
 }
 
+// かたまりが1個の目安の行数(maxLineCount)を超えるときだけ、同じくらいの大きさに割る
+function splitOversizedHunks(hunks, maxLineCount) {
+  const pieces = [];
+  for (const hunk of hunks) {
+    if (hunk.ids.length <= maxLineCount) {
+      pieces.push(hunk);
+      continue;
+    }
+    const partCount = Math.ceil(hunk.ids.length / maxLineCount);
+    const partSize = Math.ceil(hunk.ids.length / partCount);
+    for (let start = 0; start < hunk.ids.length; start += partSize) {
+      pieces.push({ file: hunk.file, ids: hunk.ids.slice(start, start + partSize) });
+    }
+  }
+  return pieces;
+}
+
+// ファイル名は基本の名前(ベース名)の出現順で重複を除く
+function uniqueFileNames(fileList) {
+  const names = [];
+  for (const file of fileList) {
+    const name = path.basename(file.file);
+    if (!names.includes(name)) names.push(name);
+  }
+  return names;
+}
+
 // 仮の題はファイル名と連番にする。かたまりの見出しは本文の途中行を拾って同じ文字列が並ぶことがある
-// ファイルをまたいでまとめると読み手が追えなくなるので、まとめるのは同じファイルの中だけにする
+// 複数ファイルにまたがるstepは、最初のファイル名と残りのファイル数で表す
+function draftStepTitle(fileNames, stepCountByFileName) {
+  const firstFileName = fileNames[0];
+  if (fileNames.length === 1) {
+    const numberInFile = (stepCountByFileName.get(firstFileName) || 0) + 1;
+    stepCountByFileName.set(firstFileName, numberInFile);
+    return firstFileName + " の" + numberInFile + "つ目の変更";
+  }
+  return firstFileName + " ほか" + (fileNames.length - 1) + "ファイルの変更";
+}
+
+// 全変更行数からステップ数(3〜10)を見積もり、その目安に収まるようファイルをまたいでかたまりをまとめる
+// かたまりが3個に満たないときは、無理に3ステップへ割らずかたまりの数をそのままステップ数にする
 function buildDraftSteps(files) {
-  const mergedHunks = [];
+  const rawHunks = [];
   for (const file of files) {
     for (const hunk of file.hunks) {
       if (hunk.ids.length === 0) continue;
-      const isMergeableSize = hunk.ids.length <= DRAFT_HUNK_LINES_MAX;
-      const previous = mergedHunks[mergedHunks.length - 1];
-      const canMerge = previous != null && previous.file === file && previous.isMergeableSize && isMergeableSize
-        && previous.ids.length + hunk.ids.length <= CHANGED_LINES_PER_STEP_GUIDE;
-      if (canMerge) {
-        previous.ids = previous.ids.concat(hunk.ids);
-        continue;
-      }
-      mergedHunks.push({ file, ids: hunk.ids, isMergeableSize });
+      rawHunks.push({ file, ids: hunk.ids });
     }
   }
-  const steps = [];
+  if (rawHunks.length === 0) return [];
+
   const stepCountByFileName = new Map();
-  for (const mergedHunk of mergedHunks) {
-    const fileName = path.basename(mergedHunk.file.file);
-    const partCount = Math.ceil(mergedHunk.ids.length / CHANGED_LINES_PER_STEP_GUIDE);
-    const partSize = Math.ceil(mergedHunk.ids.length / partCount);
-    for (let start = 0; start < mergedHunk.ids.length; start += partSize) {
-      const numberInFile = (stepCountByFileName.get(fileName) || 0) + 1;
-      stepCountByFileName.set(fileName, numberInFile);
-      steps.push(buildStep(steps.length + 1, fileName + " の" + numberInFile + "つ目の変更", mergedHunk.ids.slice(start, start + partSize)));
-    }
+  if (rawHunks.length < DRAFT_STEP_COUNT_MIN) {
+    return rawHunks.map((hunk, index) => buildStep(index + 1, draftStepTitle(uniqueFileNames([hunk.file]), stepCountByFileName), hunk.ids));
   }
-  return steps;
+
+  const totalLineCount = rawHunks.reduce((sum, hunk) => sum + hunk.ids.length, 0);
+  const idealStepCount = Math.min(DRAFT_STEP_COUNT_MAX, Math.max(DRAFT_STEP_COUNT_MIN, Math.round(totalLineCount / CHANGED_LINES_PER_STEP_GUIDE)));
+  const targetLinesPerStep = Math.max(1, Math.ceil(totalLineCount / idealStepCount));
+  const pieces = splitOversizedHunks(rawHunks, targetLinesPerStep);
+
+  // 全体に対する行の位置の割合でステップ番号(0〜idealStepCount-1)を決める。累積が単調に増えるので、
+  // 出てくるステップ番号の種類はidealStepCountを超えず、ステップ数が3〜10からあふれない
+  const groups = [];
+  let cumulativeLineCount = 0;
+  for (const piece of pieces) {
+    const bandIndex = Math.min(idealStepCount - 1, Math.floor(cumulativeLineCount / totalLineCount * idealStepCount));
+    cumulativeLineCount += piece.ids.length;
+    const currentGroup = groups[groups.length - 1];
+    if (currentGroup != null && currentGroup.bandIndex === bandIndex) {
+      currentGroup.ids = currentGroup.ids.concat(piece.ids);
+      currentGroup.files.push(piece.file);
+      continue;
+    }
+    groups.push({ bandIndex, ids: piece.ids.slice(), files: [piece.file] });
+  }
+
+  return groups.map((group, index) => buildStep(index + 1, draftStepTitle(uniqueFileNames(group.files), stepCountByFileName), group.ids));
 }
 
 // 並びは走っている間に増減するので、order と題でステップの身元を確かめる
@@ -1024,6 +1072,43 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
   const hasRangeArgs = effectiveRepoList.some((repo) => repo.diffArgs.length > 0);
   const sameAsBeforeNote = isSameAsBefore ? "。前回と同じ差分です" + (hasRangeArgs ? "。範囲を指定しているときは修正をコミットしないと反映されません" : "") : "";
   console.log("追従: 引き継ぎ " + idMap.size + "件, 消えた行 " + lostIds.length + "件, 増えた行 " + newIds.length + "件" + sameAsBeforeNote);
+}
+
+// 区切り直し。steps.json を消して prep --with-draft をやり直し、コメントは line_text で本文照合して新しい change_id に付け替える
+function runRebuild(targetDir) {
+  const changesPath = path.join(targetDir, "changes.json");
+  if (!fs.existsSync(changesPath)) {
+    console.log("作り直せません: 先に prep を実行してください");
+    return;
+  }
+  let previousChanges;
+  try {
+    previousChanges = readChanges(targetDir);
+  } catch (error) {
+    console.log("作り直せません: 前回の changes.json が壊れています(" + String(error.message).split("\n")[0].trim() + ")");
+    return;
+  }
+  if (!Array.isArray(previousChanges.files)) {
+    console.log("作り直せません: 前回の changes.json に files がありません");
+    return;
+  }
+  const previousComments = readJson(path.join(targetDir, "comments.json"), []);
+  const stepsPath = path.join(targetDir, "steps.json");
+  const previousStepsText = fs.existsSync(stepsPath) ? fs.readFileSync(stepsPath, "utf8") : null;
+  try {
+    fs.unlinkSync(stepsPath);
+  } catch (error) {
+  }
+  runPrep(targetDir, [], false, false, true);
+  if (!fs.existsSync(stepsPath)) {
+    if (previousStepsText != null) writeFileAtomic(stepsPath, previousStepsText);
+    console.log("作り直せません: 差分が無いか取得に失敗しました。既存の区切りをそのまま残します");
+    return;
+  }
+  const currentChanges = readChanges(targetDir);
+  const idMap = buildIdMap(previousChanges.files, currentChanges.files).idMap;
+  writeFileAtomic(path.join(targetDir, "comments.json"), JSON.stringify(remapComments(previousComments, idMap, currentChanges.files), null, 2));
+  console.log("作り直し: 区切りを作り直しました。コメント " + previousComments.length + "件を新しい区切りに付け替えました");
 }
 
 function expandOwnsFiles(ownsFiles, files) {
@@ -1656,6 +1741,7 @@ function appendServeLog(targetDir, message) {
 
 function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
   let isFollowRunning = false;
+  let isRebuildRunning = false;
   const server = http.createServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/health") {
@@ -1749,6 +1835,48 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
           if (signal != null) fs.writeSync(logFd, "prep異常終了: シグナル" + signal + "\n");
           else if (exitCode !== 0) fs.writeSync(logFd, "prep異常終了: 終了コード" + exitCode + "\n");
           stopFollowing();
+        });
+        child.unref();
+        sendJson(response, 200, { started: true });
+        return;
+      }
+      if (request.method === "POST" && request.url === "/rebuild") {
+        if (isRebuildRunning) {
+          sendJson(response, 409, { started: false, error: "区切りの作り直しが実行中です" });
+          return;
+        }
+        let logFd;
+        try {
+          logFd = fs.openSync(path.join(targetDir, "serve.log"), "a");
+        } catch (error) {
+          sendJson(response, 500, { error: String(error && error.message ? error.message : error) });
+          return;
+        }
+        let cwd;
+        try {
+          cwd = resolveCwd(readChanges(targetDir));
+        } catch (error) {
+          fs.closeSync(logFd);
+          sendJson(response, 500, { error: String(error && error.message ? error.message : error) });
+          return;
+        }
+        const child = spawn(process.execPath, [__filename, "rebuild", path.resolve(targetDir)], { cwd, stdio: ["ignore", logFd, logFd], detached: true });
+        isRebuildRunning = true;
+        let stopped = false;
+        const stopRebuilding = () => {
+          if (stopped) return;
+          stopped = true;
+          isRebuildRunning = false;
+          fs.closeSync(logFd);
+        };
+        child.on("error", (error) => {
+          fs.writeSync(logFd, "rebuild起動失敗: " + String(error && error.message ? error.message : error) + "\n");
+          stopRebuilding();
+        });
+        child.on("exit", (exitCode, signal) => {
+          if (signal != null) fs.writeSync(logFd, "rebuild異常終了: シグナル" + signal + "\n");
+          else if (exitCode !== 0) fs.writeSync(logFd, "rebuild異常終了: 終了コード" + exitCode + "\n");
+          stopRebuilding();
         });
         child.unref();
         sendJson(response, 200, { started: true });
@@ -1858,6 +1986,7 @@ var readStepOrders={}, resumeStepOrder=null, progressSaveTimer=null;
 var viewMode='split';
 var CONTEXT_LINES=3;
 var FOLLOW_COOLDOWN_MSEC=5000;
+var REBUILD_COOLDOWN_MSEC=5000;
 // 読み飛ばしで連打されても書き込みが増えないよう、最後の移動からこれだけ待ってまとめて送る
 var PROGRESS_SAVE_DELAY_MSEC=1500;
 // 単語単位で色を分けてよいと判断する、共通するトークンの最低の割合
@@ -2937,6 +3066,25 @@ document.getElementById('followBtn').onclick=function(){
     followBtn.disabled=false;
   });
 };
+document.getElementById('rebuildBtn').onclick=function(){
+  if(!confirm('いまの説明文は消えます。作り直しますか')) return;
+  var rebuildBtn=document.getElementById('rebuildBtn');
+  var msg=document.getElementById('doneMsg');
+  rebuildBtn.disabled=true;
+  msg.textContent='区切りを作り直しています';
+  msg.style.display='block';
+  fetch('/rebuild',{method:'POST'}).then(function(response){
+    return response.json().then(function(body){
+      if(!response.ok) throw new Error(body.error||'区切りの作り直しに失敗しました');
+      msg.textContent='区切りの作り直しを始めました。まもなく反映されます';
+      setTimeout(function(){rebuildBtn.disabled=false;}, REBUILD_COOLDOWN_MSEC);
+    });
+  }).catch(function(error){
+    msg.textContent=error instanceof TypeError?'区切りの作り直しに失敗しました。サーバが起動しているか確認してください':error.message;
+    msg.style.display='block';
+    rebuildBtn.disabled=false;
+  });
+};
 document.getElementById('doneBtn').onclick=function(){
   fetch('/done',{method:'POST'}).then(function(){
     var msg=document.getElementById('doneMsg');
@@ -3272,6 +3420,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 <span class='spacer'></span>
 <button id='resolvedBtn' style='display:none'></button>
 <button id='followBtn'>差分を取り込む</button>
+<button id='rebuildBtn'>作り直す</button>
 <button id='doneBtn' class='done-btn'>レビュー完了</button>
 <button id='closeBtn'>終了</button>
 </div>
@@ -3298,7 +3447,7 @@ function main() {
   const command = args[0];
   const targetDir = args[1];
   if (!command || !targetDir) {
-    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] [--with-draft] | node storiff.js fill <dir> | node storiff.js check <dir> | node storiff.js reply <dir> <コメント番号> <本文> [--keep-resolved] | node storiff.js serve <dir> [--port N] [--host H]");
+    console.log("使い方: node storiff.js prep <dir> [--repo P [範囲]]... [--with-remote] [--with-draft] | node storiff.js rebuild <dir> | node storiff.js fill <dir> | node storiff.js check <dir> | node storiff.js reply <dir> <コメント番号> <本文> [--keep-resolved] | node storiff.js serve <dir> [--port N] [--host H]");
     process.exit(1);
   }
   if (command === "check") {
@@ -3329,14 +3478,17 @@ function main() {
     for (const file of changes.files) {
       for (const line of file.lines) if (line.id != null) idToFileKey.set(line.id, file.repo + " " + file.file);
     }
+    // 差分全体を3〜10ステップに収めると1stepが80行を超えることもあるので、目安はステップ数の下限・上限に合わせて広げる
+    const stepSizeGuide = Math.max(CHANGED_LINES_PER_STEP_GUIDE, Math.ceil(changes.change_ids.length / DRAFT_STEP_COUNT_MAX));
+    const stepSizeHardLimit = Math.max(CHANGED_LINES_PER_STEP_GUIDE * 2, Math.ceil(changes.change_ids.length / DRAFT_STEP_COUNT_MIN));
     const oversizedSteps = validation.resolvedSteps
       .map((step, index) => {
         const fileKeys = new Set();
         for (const id of step.owns) if (idToFileKey.has(id)) fileKeys.add(idToFileKey.get(id));
         return { order: step.order != null ? step.order : index + 1, title: step.title || "", lineCount: step.owns.length, fileCount: fileKeys.size };
       })
-      .filter((step) => step.lineCount > CHANGED_LINES_PER_STEP_GUIDE);
-    const mustSplit = oversizedSteps.filter((step) => step.lineCount > CHANGED_LINES_PER_STEP_GUIDE * 2 && step.fileCount > 1);
+      .filter((step) => step.lineCount > stepSizeGuide);
+    const mustSplit = oversizedSteps.filter((step) => step.lineCount > stepSizeHardLimit && step.fileCount > 1);
     const advisory = oversizedSteps.filter((step) => !mustSplit.includes(step));
     if (mustSplit.length > 0) {
       console.log("ng: 明らかに大きく複数ファイルにまたがるstepは分割する。サブ対象ごとに分け、同じ対象の追加と削除は対のまま入れる。追加と削除など作業種類では割らない");
@@ -3349,7 +3501,7 @@ function main() {
     const diagramNote = diagramStepCount > 0 ? "(図 " + diagramStepCount + "枚)" : "";
     console.log("ok: 全" + changes.change_ids.length + "件の変更IDがちょうど1回ずつ owns に入っています" + diagramNote);
     if (advisory.length > 0) {
-      console.log("参考 目安 " + CHANGED_LINES_PER_STEP_GUIDE + "行を超えるstep(浅く広い機械的変更や自動生成物ならこのままでよい。密な実装なら分割を検討)");
+      console.log("参考 目安 " + stepSizeGuide + "行を超えるstep(浅く広い機械的変更や自動生成物ならこのままでよい。密な実装なら分割を検討)");
       for (const step of advisory) {
         console.log("  step" + step.order + " " + step.title + " (" + step.lineCount + "行, " + step.fileCount + "ファイル)");
       }
@@ -3430,6 +3582,15 @@ function main() {
     }
     return;
   }
+  if (command === "rebuild") {
+    try {
+      runRebuild(targetDir);
+    } catch (error) {
+      console.log("作り直せません: steps.json か comments.json が壊れています(" + String(error.message).split("\n")[0].trim() + ")");
+      process.exit(1);
+    }
+    return;
+  }
   if (command === "serve") {
     let requestedPort = null;
     const portIndex = args.indexOf("--port");
@@ -3489,10 +3650,12 @@ module.exports.foldIdsToRanges = foldIdsToRanges;
 module.exports.remapSteps = remapSteps;
 module.exports.remapComments = remapComments;
 module.exports.runPrep = runPrep;
+module.exports.runRebuild = runRebuild;
 module.exports.parseDiff = parseDiff;
 module.exports.buildDraftSteps = buildDraftSteps;
 module.exports.buildFillPrompt = buildFillPrompt;
-module.exports.DRAFT_HUNK_LINES_MAX = DRAFT_HUNK_LINES_MAX;
+module.exports.DRAFT_STEP_COUNT_MIN = DRAFT_STEP_COUNT_MIN;
+module.exports.DRAFT_STEP_COUNT_MAX = DRAFT_STEP_COUNT_MAX;
 module.exports.runFill = runFill;
 module.exports.buildCommitRange = buildCommitRange;
 module.exports.collectIssueNumbers = collectIssueNumbers;
