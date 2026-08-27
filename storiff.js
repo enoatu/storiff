@@ -2668,9 +2668,24 @@ function fileNote(step, file){
   if(notes[file.file]!=null) return notes[file.file];
   return null;
 }
+
+// このファイルが全部で何コマに出て、いまが何コマ目かの文字列。1コマにしか出ないなら null
+function fileStepCountLabel(file, currentStepOrder){
+  var fileIds={};
+  file.lines.forEach(function(line){if(line.id!=null) fileIds[line.id]=true;});
+  var owningOrders=[];
+  story.steps.forEach(function(candidateStep, index){
+    var owns=candidateStep.owns||[];
+    if(owns.some(function(id){return fileIds[id];})) owningOrders.push(stepNumber(candidateStep, index));
+  });
+  owningOrders.sort(function(orderA, orderB){return orderA-orderB;});
+  if(owningOrders.length<2) return null;
+  return (owningOrders.indexOf(currentStepOrder)+1)+'/'+owningOrders.length;
+}
 function renderFile(file, step, ownsSet, refsSet){
   var card=document.createElement('div');
   card.className='file';
+  var stepOrder=stepNumber(step, stepIndex);
   var heading=document.createElement('div');
   heading.className='file-head';
   if(file.repo&&file.repo!=='.'){
@@ -2687,6 +2702,13 @@ function renderFile(file, step, ownsSet, refsSet){
   statusLabel.textContent=file.status;
   heading.appendChild(pathLabel);
   heading.appendChild(statusLabel);
+  var countLabel=fileStepCountLabel(file, stepOrder);
+  if(countLabel!=null){
+    var countSpan=document.createElement('span');
+    countSpan.className='file-count';
+    countSpan.textContent=countLabel;
+    heading.appendChild(countSpan);
+  }
   card.appendChild(heading);
   var note=fileNote(step, file);
   if(note!=null){
@@ -2697,7 +2719,6 @@ function renderFile(file, step, ownsSet, refsSet){
   }
   var code=document.createElement('div');
   code.className=viewMode==='split'?'code split':'code';
-  var stepOrder=stepNumber(step, stepIndex);
   var visible=computeVisible(file.lines, ownsSet, refsSet);
   if(viewMode==='split') renderSplitCode(code, file, stepOrder, ownsSet, refsSet, visible);
   else renderUnifiedCode(code, file, stepOrder, ownsSet, refsSet, visible);
@@ -3313,6 +3334,7 @@ code{font-family:var(--code-font);font-size:.92em;background:var(--surface-soft)
 .file-head .path{font-family:var(--code-font);font-size:13px;font-weight:600;word-break:break-all}
 .file-head .repo{font-family:var(--code-font);font-size:11px;padding:2px 7px;background:var(--accent-soft);color:var(--accent);border-radius:6px}
 .file-head .status{margin-left:auto;font-size:11px;padding:2px 8px;border-radius:20px;background:#eaeef2;color:var(--text-soft)}
+.file-head .file-count{margin-left:6px;font-size:11px;color:var(--text-soft);font-family:var(--code-font)}
 .file-note{padding:10px 16px;font-size:13px;line-height:1.6;color:var(--text-soft);border-bottom:1px solid var(--border-soft);background:#fbfcfe}
 .status-added{background:#e6f6ec;color:#1a7f37}
 .status-deleted{background:#ffebe9;color:#cf222e}
