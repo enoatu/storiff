@@ -3515,10 +3515,10 @@ function main() {
         return { order: step.order != null ? step.order : index + 1, title: step.title || "", lineCount: step.owns.length, fileCount: fileKeys.size };
       })
       .filter((step) => step.lineCount > stepSizeGuide);
-    const mustSplit = oversizedSteps.filter((step) => step.lineCount > stepSizeHardLimit && step.fileCount > 1);
+    const mustSplit = oversizedSteps.filter((step) => step.lineCount > stepSizeHardLimit);
     const advisory = oversizedSteps.filter((step) => !mustSplit.includes(step));
     if (mustSplit.length > 0) {
-      console.log("ng: 明らかに大きく複数ファイルにまたがるstepは分割する。サブ対象ごとに分け、同じ対象の追加と削除は対のまま入れる。追加と削除など作業種類では割らない");
+      console.log("ng: 明らかに大きいstepは分割する。サブ対象ごとに分け、1ファイルの中でも意図が変わるところで割る。同じ対象の追加と削除は対のまま入れる。追加と削除など作業種類では割らない");
       for (const step of mustSplit) {
         console.log("  step" + step.order + " " + step.title + " (" + step.lineCount + "行, " + step.fileCount + "ファイル)");
       }
