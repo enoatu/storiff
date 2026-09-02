@@ -30,8 +30,17 @@ const OVERVIEW_SUMMARY_LENGTH_GUIDE = 200;
 // 説明文を書く子プロセスに許す道具。材料を読むだけでよく、steps.json のあるディレクトリに書かせない
 const FILL_ALLOWED_TOOLS = "Read,Glob,Grep";
 
+// 説明文を書くモデル。150文字を1本書くだけなので、既定のまま一番重いモデルに任せると待ち時間だけが増える
+// 同じプロンプトを5回ずつ測った中央値は sonnet 8.8秒、既定 20.2秒、haiku 19.5秒
+// haiku は文字数の指示を守れず出力が sonnet の4.7倍に伸びるので、安いのに遅い
+const FILL_MODEL = "sonnet";
+
 // 1ステップの説明文の上限の目安。流暢で長い説明は、読み手に分かった気だけを残すので短く保つ
 const FILL_NARRATION_LENGTH_GUIDE = 150;
+
+// 書き直させる境目。目安を数文字超えただけで書き直すと1コマに2本の claude を使う
+// 実測では8コマのうち4コマが153〜155文字で書き直しに入り、fill 全体が倍近くまで伸びていた
+const FILL_NARRATION_LENGTH_MAX = 180;
 
 // 前回と今回のどちらかで同じ内容の行がこの本数を超えたら、単調増加列の候補から外し出現順に対応させる
 const SAME_CONTENT_LINE_COUNT_MAX = 100;
@@ -1585,7 +1594,7 @@ function narrationLength(text) {
   return Array.from(text).length;
 }
 
-function buildFillPrompt(targetDir, step, stepNumber, stepCount, diffText, tooLongNarration) {
+function buildFillPrompt(targetDir, step, stepNumber, stepCount, diffText) {
   return [
     "コード差分のレビューを紙芝居で見せます。その1コマ分の説明文を書いてください",
     "",
@@ -1603,13 +1612,25 @@ function buildFillPrompt(targetDir, step, stepNumber, stepCount, diffText, tooLo
     "",
     "書き方",
     "- " + FILL_NARRATION_LENGTH_GUIDE + "文字以内。長い説明は読み手に分かった気だけを残すので短く書く",
-    tooLongNarration == null
-      ? ""
-      : "前の答えは" + narrationLength(tooLongNarration) + "文字で長すぎました。何をしたかを削り、なぜそうしたかを残して"
-        + FILL_NARRATION_LENGTH_GUIDE + "文字以内に書き直してください\n前の答え\n" + tooLongNarration,
     "- 何をしたかは1文か2文まで。差分を読めば分かることを言いかえない",
     "- 残りはなぜそうしたかに使う。削るのは何をしたかの側で、なぜは残す",
     "- 材料から読み取れないことは書かない。推測で補わない",
+    "- 説明文だけを出力する。前置きも見出しも付けない",
+  ].join("\n");
+}
+
+// 書き直しは前の答えを短くするだけなので、差分も材料のファイルも渡さない
+// 1本目と同じプロンプトを送り直すと、2本目も1本目と同じだけかかって書き直したコマの表示が倍遅れる
+function buildShortenPrompt(tooLongNarration) {
+  return [
+    "紙芝居の1コマの説明文が長すぎました。" + FILL_NARRATION_LENGTH_GUIDE + "文字以内に書き直してください",
+    "",
+    "いまの説明文 " + narrationLength(tooLongNarration) + "文字",
+    tooLongNarration,
+    "",
+    "書き方",
+    "- 削るのは何をしたかの側で、なぜそうしたかは残す",
+    "- ここに書かれていないことを足さない",
     "- 説明文だけを出力する。前置きも見出しも付けない",
   ].join("\n");
 }
@@ -1651,9 +1672,14 @@ function runFill(targetDir, onDone) {
     const fillTarget = fillTargets[startedCount];
     startedCount++;
     const diffText = buildChangesText(changes.files, fillTarget.ownedIds);
-    const askClaude = (tooLongNarration, onNarration) => {
-      const prompt = buildFillPrompt(targetDir, fillTarget.step, fillTarget.stepNumber, stepList.length, diffText, tooLongNarration);
-      const claudeArgs = ["-p", "--no-session-persistence", "--add-dir", targetDir, "--allowedTools", FILL_ALLOWED_TOOLS, "--output-format", "json", prompt];
+    const askClaude = (onNarration) => {
+      const prompt = buildFillPrompt(targetDir, fillTarget.step, fillTarget.stepNumber, stepList.length, diffText);
+      const claudeArgs = ["-p", "--model", FILL_MODEL, "--no-session-persistence", "--add-dir", targetDir, "--allowedTools", FILL_ALLOWED_TOOLS, "--output-format", "json", prompt];
+      runClaude(cwd, claudeArgs, onNarration);
+    };
+    // 書き直しは前の答えだけを渡すので、材料を読む権限も道具も要らない
+    const askShorten = (tooLongNarration, onNarration) => {
+      const claudeArgs = ["-p", "--model", FILL_MODEL, "--no-session-persistence", "--output-format", "json", buildShortenPrompt(tooLongNarration)];
       runClaude(cwd, claudeArgs, onNarration);
     };
     const useNarration = (narration) => {
@@ -1666,14 +1692,14 @@ function runFill(targetDir, onDone) {
       startNext();
     };
     // 目安を指示するだけでは守られないので、長さを数えて1回だけ書き直させる。2回目も長ければそのまま使う
-    askClaude(null, (narration) => {
+    askClaude((narration) => {
       const text = narration.trim();
-      if (text === "" || narrationLength(text) <= FILL_NARRATION_LENGTH_GUIDE) {
+      if (text === "" || narrationLength(text) <= FILL_NARRATION_LENGTH_MAX) {
         useNarration(text);
         return;
       }
       console.log("fill: step" + fillTarget.stepNumber + " が" + narrationLength(text) + "文字だったので書き直させます");
-      askClaude(text, (retried) => {
+      askShorten(text, (retried) => {
         const retriedText = retried.trim();
         useNarration(retriedText === "" ? text : retriedText);
       });
@@ -3681,6 +3707,7 @@ module.exports.runRebuild = runRebuild;
 module.exports.parseDiff = parseDiff;
 module.exports.buildDraftSteps = buildDraftSteps;
 module.exports.buildFillPrompt = buildFillPrompt;
+module.exports.buildShortenPrompt = buildShortenPrompt;
 module.exports.DRAFT_STEP_COUNT_MIN = DRAFT_STEP_COUNT_MIN;
 module.exports.DRAFT_STEP_COUNT_MAX = DRAFT_STEP_COUNT_MAX;
 module.exports.runFill = runFill;
