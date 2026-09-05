@@ -135,6 +135,8 @@ function parseDiff(diffText, repo, startId) {
     }
     if (rawLine.startsWith("rename from ")) {
       currentFile.status = "renamed";
+      // 変更前の中身は旧パスにしか無い。改名前の名前を捨てると git show で引けなくなる
+      currentFile.old_file = rawLine.slice("rename from ".length);
       continue;
     }
     if (rawLine.startsWith("rename to ")) {
@@ -733,6 +735,39 @@ function formatGithubItem(pullRequestOrIssue) {
 }
 
 // 1リポジトリ分の意図の材料を集める。取れなかった材料は静かに飛ばし、取れた分だけ返す
+// 差分の左側がどのコミットかを決める。git diff の引数の書き方ごとに読み方が違う
+//   引数なし              作業ツリーと HEAD を比べているので HEAD
+//   A                     A と作業ツリー
+//   A..B                  A と B
+//   A...B                 A と B の分かれ道。素朴に A を使うと枝分かれ後の変更まで混ざる
+//   A B                   A と B
+function resolveBaseRef(diffArgs) {
+  if (diffArgs.length === 0) return "HEAD";
+  if (diffArgs.length > 1) return diffArgs[0];
+  const singleArg = diffArgs[0];
+  const threeDotIndex = singleArg.indexOf("...");
+  if (threeDotIndex !== -1) {
+    return { mergeBase: [singleArg.slice(0, threeDotIndex) || "HEAD", singleArg.slice(threeDotIndex + 3) || "HEAD"] };
+  }
+  const twoDotIndex = singleArg.indexOf("..");
+  if (twoDotIndex !== -1) return singleArg.slice(0, twoDotIndex) || "HEAD";
+  return singleArg;
+}
+
+// origin/main のように後から動く名前は、prep した時点の SHA に固定して覚える
+// 覚えないと、fetch のあとで変更前の中身が別のものに変わってしまう
+function resolveBaseSha(repoPath, diffArgs) {
+  const baseRef = resolveBaseRef(diffArgs);
+  if (typeof baseRef === "object") {
+    const mergeBaseText = runCommandOrNull("git", ["merge-base", ...baseRef.mergeBase], repoPath);
+    if (mergeBaseText == null) return null;
+    return mergeBaseText.trim() || null;
+  }
+  const shaText = runCommandOrNull("git", ["rev-parse", baseRef], repoPath);
+  if (shaText == null) return null;
+  return shaText.trim() || null;
+}
+
 function collectRepoContext(specifiedRepoPath, repoPath, diffArgs, useRemoteContext) {
   const branchText = runCommandOrNull("git", ["rev-parse", "--abbrev-ref", "HEAD"], repoPath);
   const branchName = branchText == null ? "" : branchText.trim();
@@ -935,6 +970,7 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
   const diffTargets = [];
   const repoContexts = [];
   const repoPathMap = new Map();
+  const baseShaByRepo = {};
   for (const repo of effectiveRepoList) {
     const repoPath = usingRecordedRepoList ? path.resolve(cwd, repo.path) : repo.path;
     const diffArgs = repo.diffArgs.length > 0 ? repo.diffArgs : ["HEAD"];
@@ -952,6 +988,8 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
     collectedFiles.push(...parseDiff(diffText, repo.path, 1).files);
     repoContexts.push(collectRepoContext(repo.path, repoPath, diffArgs, useRemoteContext));
     repoPathMap.set(repo.path, repoPath);
+    const baseSha = resolveBaseSha(repoPath, diffArgs);
+    if (baseSha != null) baseShaByRepo[repo.path] = baseSha;
   }
   const excludePatterns = NOISE_PATTERNS.concat(config.exclude || []);
   const reviewableFiles = collectedFiles.filter((file) => !matchesFilePattern(file.file, excludePatterns));
@@ -990,6 +1028,7 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
     repo_args: effectiveRepoList,
     cwd,
     with_remote: useRemoteContext,
+    base_sha: baseShaByRepo,
     files,
     change_ids: changeIds,
   };
@@ -3779,5 +3818,6 @@ module.exports.buildOverviewIssues = buildOverviewIssues;
 module.exports.buildStepRisksIssues = buildStepRisksIssues;
 module.exports.parseDiagram = parseDiagram;
 module.exports.buildDiagramValidation = buildDiagramValidation;
+module.exports.resolveBaseRef = resolveBaseRef;
 module.exports.VIEWER_HTML = VIEWER_HTML;
 module.exports.VIEWER_SCRIPT = VIEWER_SCRIPT;

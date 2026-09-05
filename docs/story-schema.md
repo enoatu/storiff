@@ -37,6 +37,7 @@ storiff.js(Node単一ファイル)とビューア、skill が共有する契約�
   "repo_args": [{"path": ".", "diffArgs": []}],
   "cwd": "/path/to/repo",
   "with_remote": false,
+  "base_sha": {".": "8b184dc785b789ca152cd4a1c7b0156dc133ddc5"},
   "files": [
     {
       "repo": ".",
@@ -55,11 +56,15 @@ storiff.js(Node単一ファイル)とビューア、skill が共有する契約�
 ```
 - text は行頭の +/-/空白マーカーを除いた本文
 - status は modified と added と deleted と renamed のどれか
+- old_file: renamed のときだけ入る改名前のパス。変更前の中身は旧パスにしか無いので、git から引くのに要る
 - hunks: そのファイルの差分のかたまり。並びは `@@` の出てくる順。`ids` はそのかたまりに入っている変更IDで、区切りの下書きを作るときに使う
 - repo はそのファイルが属するリポジトリのパス。単一リポジトリなら "."。複数でも変更IDは全体で通し番号
 - repo_args: prep に渡されたリポジトリと範囲の指定。追従で同じ範囲を再実行するために使う
 - cwd: 初回 prep を実行した場所。リポジトリのパスが相対指定のときの起点。追従では前回の値を引き継ぐ
 - with_remote: context.txt を集めるときに GitHub まで見にいったかどうかの記録。次の prep の動きは変えない
+- base_sha: リポジトリのパスごとの、差分の左側のコミット。prep した時点で SHA に固定して覚える。
+  origin/main のような後から動く名前のままだと、fetch の後で変更前の中身が別のものに変わってしまう。
+  `A...B` の左側は A ではなく `git merge-base A B`
 
 ## changes.txt(prep が生成、ストーリー作成時に読むスリム版)
 コンテキスト行を落とし、変更行(add と del)だけを持つ。

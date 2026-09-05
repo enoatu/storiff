@@ -1,155 +1,307 @@
 # storiff
 
-ストーリー + diff。巨大な差分をAIが小さな意図単位のストーリーに分解し、紙芝居形式でレビューさせるツール。[crit](https://github.com/tomasz-tomczyk/crit) をベースにした発想で、ストーリーがありそのdiffを見れる。
+A big diff gives you no place to start.
+Let AI split it into steps by intent, and read one step at a time.
 
-でかい差分はどこから見ればいいかわからない。そこでAIにストーリーを出してもらい、少しずつ全体が分かるようにする。
-
-## 仕組み
-- prep がカレントの作業差分を読み、変更行1つずつに通し番号(変更ID)を振って書き出す。`--with-draft` を付けたときだけ、差分のかたまりからステップの区切りも機械で作る
-- serve が Node単一ファイルの極小ローカルビューアを立て、URL をその場で返す
-- fill が説明文を後ろで埋め、ビューアが3秒ごとに拾って描き直す
-- コメントは会話に返り、Claudeが回答する
-
-変更IDを意図・ビジネスロジック単位のステップにまとめるのは Claude で、区切りの下書きがあるときはそれをまとめ直すところから始める。同じ変更IDを2つのステップが持つことはなく、すべての変更IDがどれかのステップに1回ずつ入る。だからストーリーをすべて合わせると指定した差分のdiffになる。
-
-## 全体像
-ステップを1つずつ追う前に、差分全体を見渡せるようにしている。AI がストーリーと一緒に全体像を書き、ビューアの最初のステップで差分より前に出す。
-
-- 要約(summary) 何に困っていて、どう解いたか
-- 主な変更(key_changes) 読み手が知りたい変更だけを箇条書きで
-- 気をつける点(risks) 壊れると影響が大きいところ、やり残したところ
-
-題名だけでは、どれくらいの大きさの差分を何のために読むのかが分からない。先にここを読んでからステップに入ると、いま見ているステップが全体のどこなのかを見失いにくい。
-
-## コマごとの気をつける点
-全体像の気をつける点は差分全体で1つの箇条書きなので、どのコマの話なのかが伝わらない。そこでステップ側にも `risks` を持てるようにした。そのコマを開くと、差分の手前に警告色の枠で出る。説明文に混ぜると読み飛ばされるため別の枠にしている。
-
-書くのは全体像を考えるサブエージェント。差分の全部に目を通す工程はそこだけで、コマごとに説明文を書く fill は担当の差分しか読まないため、全体を見ないと気づけないものを書けない。危なそうなところが無いコマには書かない。全部のコマに付くと読まれなくなる。
-
-## 変更どうしのつながり
-どこで区切るかを決めるのは難しいので、prep が変更行から手がかりを拾って `hints.txt` に書き出す。「src/api.js の fetchUser を 変更ID 12 で定義し、変更ID 45, 46 が使っています」のような1行が並び、Claude はこれを参考にステップの境界を決める。
-
-外部のツールも npm も使わず、名前の見た目だけで拾う。対応は JavaScript と TypeScript と Python と Go で、それ以外の言語は静かに飛ばす。あくまで参考なので、ヒントが空でもストーリーは作れる。
-
-## 区切りの下書き
-どこで区切るかを AI に一から考えさせると、変更行が増えるほど待たされる。git diff は差分をすでに `@@` のかたまりに割っていて、その数は AI が出すステップ数と桁が同じになる。そこで `node storiff.js prep <dir> --with-draft` を付けると、prep がかたまりから区切りだけ先に作って `steps.json` に置く。
-
-- 1つのかたまりが1ステップ。隣り合う小さいかたまりはまとめ、大きすぎるかたまりは割る
-- ファイルをまたいでまとめない
-- 題は `storiff.js の2つ目の変更` のような、ファイル名と連番から作った仮のもの。説明は空で、後から fill が埋める
-- 全変更IDがちょうど1回ずつ入るので `node storiff.js check <dir>` がそのまま通る
-
-既定では作らないので、付けない限り AI が区切りから考える。`steps.json` がすでにあるときは追従の邪魔になるので上書きしない。
-
-かたまりは近い変更行がまとまっているだけで意図の単位ではないので、下書きはあくまで土台になる。意図に合わせてまとめ直してよい。
-
-## 読みながら説明文が埋まる
-下書きの説明文は空なので、そこを `node storiff.js fill <dir>` が埋める。ステップ1つにつき `claude -p` を1つ立て、何本かを同時に走らせる。
-
-大事なのは、全部書き終わるのを待たないこと。1つ書けたらその場で `steps.json` に戻す。ビューアは3秒ごとに差分を取りに行って変わったところだけ描き直すので、最初のステップを読んでいる間に後ろのステップが埋まっていく。手元の36ステップの差分では、最初のステップが読めるようになるまで24秒、36ステップ全部が埋まりきるまで442秒だった。読み手が待つのは最初の24秒だけで、残りは読んでいる後ろで進む。
-
-1ステップは150文字以内に抑えている。流暢で長い説明は、読み手に分かった気だけを残して理解を確かめる機会を奪うため。何をしたかは差分を見れば分かるので1文か2文で止め、残りをなぜそうしたかに使わせる。子プロセスに渡すのも担当するステップの差分そのものだけで、材料の `context.txt` と `hints.txt` は場所を添えるにとどめる。全部読ませると1ステップあたりの時間が伸びる。
-
-- まだ埋まっていないステップは、画面に「準備中」と出す。空欄のまま何も出さないと壊れて見えるため。ただし「修正N回目」のステップは、説明文が空でも準備中とは出さない
-- ステップの題は prep が付けた仮のままにして書き換えない。読んでいる途中で左の目次の並びがずれないようにするため
-- すでに説明文があるステップには触らない。手で書き直した分は残る
-- 先頭のステップから順に埋める。読み手は最初のステップから読むため
-- 途中で止めても、そこまでに書けた分は残る。もう一度実行すれば残りだけを埋める
-- `claude` が入っていない環境では静かに飛ばし、説明文は空のままにする
-
-fill が動いている間に差分を取り込むと、書けたばかりの説明文が追従で居場所を失うことがある。prep は引き継いだ件数を `fill が書いていた説明文3ステップ分を引き継ぎました`、消えた件数を `説明文2ステップ分は、追従で居場所が無くなったので消えました。fill が動いている間は差分を取り込まないでください` と知らせる。
-
-`steps.json` に書き戻すのは親プロセスだけで、子プロセスは説明文を標準出力で返すだけにしてある。
-
-## 続きから読める
-大きい差分は1日で読み切れない。どのコマまで読んだかを `<dir>/progress.json` に残すので、途中で閉じて次の日に開いても、どこまで読んだかを自分で探さなくてよい。サーバ側に置くので別のブラウザや別の端末から開いても続く。
-
-- 開いたときは必ず1コマ目から始まる。「前回は3コマ目まで読みました」と続きから読むボタンを出すだけで、勝手には飛ばさない。1コマ目から読み直したい人を邪魔しないため
-- 目次では読み終えたコマの番号が緑になる。読んだ数は出さない。目次を見れば分かるものを文字でも出すと、差分より先にサイドバーの上を場所取りするため
-- 覚えるのはステップ番号(order)だけ。追従は既存ステップの order を振り直さないので、差分を取り込んでコマが増えても位置がずれない
-- 準備中のコマは説明文がまだ無いので、読んだ記録に入れない
-
-## コメントの範囲と解決済み
-レビューを2周3周すると「これはもう直した」が区別できず、コメント欄が積み上がる一方になる。そこでコメント1件ごとに解決済みを切り替えられるようにし、解決済みは既定で隠す。隠すだけでボタンに `解決済み3件を出す` と件数が出るので、消えたようには見えない。
-
-返信が付いたコメントは自動で未解決に戻る。解決済みを隠したままだと新しい返信が埋もれるため。直したことを伝えるだけで解決済みのままにしたいときは `node storiff.js reply <dir> <番号> "<本文>" --keep-resolved` を使う。
-
-コメントを付けられる範囲は3つ。
-
-- 行 「この行はなぜこう書いたのか」
-- コマ全体 「このコマの方針が違う」。紙芝居なので、これが一番自然な単位
-- ストーリー全体 「そもそもこの分け方が違う」
-
-行に紐づかない2つは、1件でも付いていれば差分の手前に枠が出る。1件も無いときは枠を出さない。空の枠を2つ置くと、開いた直後に差分がその分だけ下へ押し出されて、一番読みたいものが画面から外れるため。書くのは固定ヘッダーの「全体にコメント」と「コマにコメント」からで、こちらは常に押せる。
-
-## 行を見失ったコメント
-コードを直して差分を取り込むと、行コメントの指す行が動く。行番号の対応表だけでは追いきれないので、行コメントを付けたときに対象の行の本文も覚えておき、対応表で写せなかったコメントはその本文でたどり直す。同じ本文の行が同じファイルに2本以上あるときは、どれを指していたか決めようがないのでたどらない。
-
-それでも見つからなかったコメントは消さずに残し、本文の上に `元の行が見つかりません。別の場所を指しているかもしれません` と添える。「無くなった」と言い切られるより、いまどこを指しているか怪しいと分かる方が読み手が判断できる。次に取り込んだときにその行が戻れば断り書きは消える。
-
-## なぜそうしたかの材料
-差分のテキストだけでは「何をしたか」しか読み取れず、説明がコードの言い換えになりやすい。そこで差分を書き出すときに、意図の材料も `context.txt` に集めてストーリー作りに渡す。
-
-- ブランチ名と、その差分に含まれるコミットの本文(Co-authored-by や Refs もそのまま)
-- ブランチ名とコミットから拾った課題番号(`#12` や `ABC-123`)
-- 変更したファイルの近くにある `CLAUDE.md` `AGENTS.md` `README.md` の場所
-- `--with-remote` を付けたときだけ、`gh` で読んだ PR と課題の説明とコメント
-
-ここまでが既定で手元の git だけで完結する。GitHub に問い合わせるのは `--with-remote` を付けたときか、`~/.storiff/config.json` に `{"with_remote": true}` と書いたときだけ。前に `--with-remote` を使った `<dir>` でも、指定し直さない限り外には出ない。ビューアの「差分を取り込む」ボタンからの追従も同じで、config に書いていなければ手元の git だけを見る。gh が入っていない、ログインしていない、ネットに出られない、GitHub ではない、といったときも取れた材料だけで動く。
-
-## ステップごとの小さい図
-呼び出しの順番や状態のうつり変わりが追いにくいステップには、そのステップが触る関係だけを描いた小さい図が付く。全体の構成図ではないので、ノードは少数に絞る。
-
-図は Mermaid の flowchart の書き方で持ち、ビューアが自分で SVG に組み立てる。描画ライブラリを読み込まないので、ネットにつながっていなくても図が出る。読み取れない図は隠すだけで、差分の表示は続く。
+[日本語](README.ja.md)
 
 ```
-flowchart LR
-  handler[deleteUser] -->|id| check{使用中か}
-  check --> db[レコードを消す]
+run /storiff
+  ↓
+read the diff, number every changed line          prep
+  ↓
+group those numbers into steps by intent          Claude
+  ↓
+a URL comes back. start reading right away        serve
+  ↓
+narrations fill in behind you                     fill
+  ↓
+comment on a line that bothers you
+  ↓
+Claude answers in the conversation
 ```
 
-`node storiff.js check <dir>` が図の書き方も検算する。読めない行、`graph` の古い書き出し、`->` や `-->>` の矢印、ノード名とラベルの重複を見る。
+## How this differs from crit
 
-## 検算
-`node storiff.js check <dir>` は `steps.json` を検算する。抜けた変更IDも、重複した変更IDも、不明なファイルも ng になる。ストーリーをすべて合わせると指定した差分になることを確かめられるのはここだけなので、owns を書き換えた後は必ず実行する。
+storiff builds on the idea behind [crit](https://github.com/tomasz-tomczyk/crit).
+Grouping a diff into chapters and reading them in order is the same. These parts differ.
 
-## インストール
-Claude Code のプラグインとして入れる。marketplace を1回追加してからインストールする。
+| | crit | storiff |
+| --- | --- | --- |
+| Unit of grouping | hunk | change id, one per changed line |
+| Narration | one summary line per chapter | a narration per step, filled in behind you |
+| Lines owned by another step | blend in when you expand context | always told apart by change id |
+| Where you read | browser | browser and neovim |
+| How far you read | | remembered, so you can continue |
+| Kept out of a chapter | `support[]` with a reason | |
+
+### Grouping by line lets one hunk be split
+
+crit groups by hunk, so a whole `@@` block lands in one chapter.
+storiff numbers every changed line, so part of the same block can belong to a different step.
+
+Intent does not line up with hunk boundaries. One block often holds both the real fix and some tidying done along the way.
+
+### Expanding context does not pull in another step's lines
+
+In crit, expanding around a hunk brings those lines in as unchanged context.
+Even a line another chapter added carries no mark saying it changed.
+
+storiff numbers every changed line and knows which step owns it,
+so even when you widen the view you can tell "another step added this".
+
+### Narrations fill in while you read
+
+A crit chapter carries one summary line, and you wait for it.
+storiff holds a narration per step and writes each one back the moment it is done.
+While you read the first step, the later ones fill in.
+
+### Read them as real files in neovim
+
+With [nvim-storiff](https://github.com/enoatu/nvim-storiff) you can read the same story in neovim.
+It opens the real files, so `gd` and `gr` still jump to definitions and references.
+
+## Install
+
+Install it as a Claude Code plugin. Add the marketplace once, then install.
 
 ```
 /plugin marketplace add enoatu/storiff
 /plugin install storiff@storiff
 ```
 
-以降どのプロジェクトからでも `/storiff` で呼べる(同名コマンドと衝突するときは `/storiff:storiff`)。npm も symlink も不要。プラグインが storiff.js と skill と docs を同梱する。
+After that `/storiff` works from any project (use `/storiff:storiff` if the name collides).
+No npm, no symlink. The plugin ships storiff.js, the skill and the docs.
 
-セッションごとの生成物(changes.json や comments.json)は `~/.storiff/<日時>/` に置かれる。
+Per-session files (changes.json, comments.json) go under `~/.storiff/<timestamp>/`.
 
-## 設定ファイル
-`~/.storiff/config.json` に既定値を書ける。`host` と `exclude`(除外するファイルパターン)と `generated`(自動生成ファイルパターン)と `with_remote`(GitHub の PR と課題も材料にするか。既定は false)に対応。
+## Usage
+
+1. Run `/storiff`
+2. A URL comes back right away. Open it and start from step 1. Narrations fill in behind you, so a step that is not ready says "preparing". If you read this diff before, a "continue" button appears
+3. As you read, comment on a line, on the step, or on the whole story. Resolve the ones you are done with
+4. After fixing code, press "pull in changes" to follow the diff
+5. Press "review done"
+6. Claude answers your comments in the conversation
+
+## What helps while reading
+
+### The overview
+
+Before following the steps one by one, you get a look at the whole diff.
+AI writes an overview along with the story, and the viewer shows it before the diff on the first step.
+
+- Summary what was wrong and how it was solved
+- Key changes only the changes a reader wants to know, as bullets
+- Risks what breaks widely if it breaks, and what was left undone
+
+A title alone does not tell you how big the diff is or what you are reading it for.
+Reading this first makes it harder to lose track of where the current step sits.
+
+### Risks per step
+
+The overview's risks are one list for the whole diff, so you cannot tell which step they are about.
+So a step can carry its own `risks`. Opening that step shows them in a warning-colored box before the diff.
+Mixed into the narration they get skipped, so they live in their own box.
+
+The subagent that writes the overview writes these.
+It is the only pass that reads the whole diff. `fill`, which writes one narration per step, only reads that step's diff,
+so it cannot notice anything that needs the whole picture.
+Steps with nothing risky get none. If every step had one, none would be read.
+
+### Narrations fill in while you read
+
+Draft narrations are empty, and `node storiff.js fill <dir>` fills them.
+One `claude -p` per step, several at a time.
+
+What matters is not waiting for all of them. Each one goes back into `steps.json` the moment it is written.
+The viewer re-fetches every 3 seconds and redraws only what changed, so later steps fill in while you read the first.
+
+On a 36-step diff here, the first step became readable after 24 seconds, and all 36 were filled after 442 seconds.
+The reader waits only for those first 24 seconds. The rest happens behind them.
+
+A narration is capped at 150 characters.
+A long, fluent explanation leaves the reader feeling they understood without a chance to check.
+What was done is visible in the diff, so it stops after a sentence or two and spends the rest on why.
+
+Each child process gets only its own step's diff. `context.txt` and `hints.txt` are passed as paths, not contents.
+Reading everything stretches the time per step.
+
+- A step that is not filled yet says "preparing". Leaving it blank looks broken. A step titled "fix N" is exempt
+- Step titles stay as prep wrote them. Rewriting them would shuffle the outline while you read
+- Steps that already have a narration are left alone. Anything you rewrote by hand stays
+- Filled from the first step onward, because that is where readers start
+- Stopping partway keeps what was written. Running it again fills only the rest
+- Where `claude` is not installed it is skipped quietly and narrations stay empty
+
+Pulling in a diff while `fill` is running can leave a fresh narration with nowhere to go.
+`prep` reports how many it carried over and how many were lost.
+
+### Continue where you left off
+
+A big diff does not fit in one day.
+How far you read is kept in `<dir>/progress.json`, so closing it and opening it tomorrow does not mean hunting for your place.
+It lives on the server, so another browser or another machine continues too.
+
+- It always opens at step 1. It only offers a "you read up to step 3" button, and never jumps on its own. Someone who wants to reread from step 1 should not be pushed
+- Finished steps turn green in the outline. The count is not shown. Printing what the outline already shows would take space above the diff
+- Only the step number is remembered. Following a diff never renumbers existing steps, so positions hold even as steps are added
+- Steps still preparing have no narration yet, so they do not count as read
+
+### A small diagram per step
+
+A step whose call order or state transitions are hard to follow gets a small diagram of just what that step touches.
+It is not an architecture diagram, so it keeps to a few nodes.
+
+Diagrams are held as Mermaid flowchart source and the viewer builds the SVG itself.
+No drawing library is loaded, so diagrams work offline.
+An unreadable diagram is simply hidden and the diff keeps rendering.
+
+```
+flowchart LR
+  handler[deleteUser] -->|id| check{in use?}
+  check --> db[delete the record]
+```
+
+## Comments
+
+### Scope and resolving
+
+Two or three rounds of review and "already fixed" becomes impossible to tell apart, so the comment list only grows.
+So each comment can be resolved, and resolved ones are hidden by default.
+Only hidden, with the button reading `show 3 resolved`, so nothing looks deleted.
+
+A comment that gets a reply goes back to unresolved. Otherwise a new reply stays buried under the hidden ones.
+To reply without reopening it, use `--keep-resolved`.
+
+```
+node storiff.js reply <dir> <number> "<body>" --keep-resolved
+```
+
+There are three scopes.
+
+- line "why is this line written this way"
+- step "this step took the wrong approach". With a story, this is the most natural unit
+- story "the split itself is wrong"
+
+The two that are not tied to a line get a box before the diff as soon as one exists. No box when there are none.
+Two empty boxes would push the diff down the moment you open it, out of the part you most want to see.
+
+### Comments that lost their line
+
+Fixing code and pulling in the diff moves the line a comment points at.
+A line-number map alone cannot follow it, so the text of the target line is remembered when the comment is written,
+and comments the map could not carry are traced by that text.
+When two or more lines in the same file share that text, there is no way to tell which one it was, so it is not traced.
+
+A comment that still cannot be found is kept, with a note above it saying the original line was not found.
+Being told it might point somewhere else lets the reader judge; being told it is gone does not.
+The note disappears if the line comes back on a later pull.
+
+## How a story is built
+
+### Change ids and steps
+
+`prep` reads the current working diff and numbers every changed line with a change id.
+Claude groups those ids into steps by intent.
+
+No change id belongs to two steps, and every change id lands in exactly one.
+So all the steps together are exactly the diff you asked for.
+
+### The draft split
+
+Having AI work out the split from nothing gets slower as changed lines grow.
+git diff already cuts the diff into `@@` blocks, and their count is the same order as the step count AI produces.
+So `--with-draft` makes prep build just the split from those blocks and write it into `steps.json`.
+
+```
+node storiff.js prep <dir> --with-draft
+```
+
+- One block, one step. Small neighboring blocks are merged, oversized ones are split
+- Never merged across files
+- Titles are placeholders built from the file name and a counter, like `the 2nd change in storiff.js`. Narrations are empty and `fill` writes them later
+- Every change id lands exactly once, so `check` passes as is
+
+It is off by default, so without the flag AI works out the split itself.
+An existing `steps.json` is never overwritten, since that would get in the way of following a diff.
+
+Blocks are just nearby changed lines, not units of intent, so the draft is only a starting point.
+Regroup it to match intent.
+
+### How changes connect
+
+Deciding where to split is hard, so prep pulls hints out of the changed lines into `hints.txt`.
+Lines like "change id 12 defines fetchUser in src/api.js, and change ids 45, 46 use it" line up there,
+and Claude uses them to decide step boundaries.
+
+No external tool, no npm. It goes by how names look.
+JavaScript, TypeScript, Python and Go are covered; other languages are skipped quietly.
+They are only hints, so a story can be built with none.
+
+### Material for the why
+
+Diff text alone only tells you what was done, which makes narrations restate the code.
+So writing out the diff also gathers material for intent into `context.txt`.
+
+- The branch name and the bodies of the commits in that diff
+- Issue numbers picked out of the branch name and commits (`#12`, `ABC-123`)
+- Where `CLAUDE.md`, `AGENTS.md` and `README.md` sit near the changed files
+- Only with `--with-remote`, the PR and issue bodies and comments read through `gh`
+
+Everything up to there stays in your local git.
+GitHub is only queried with `--with-remote`, or with `{"with_remote": true}` in `~/.storiff/config.json`.
+It still works with whatever it could gather when `gh` is missing, not logged in, offline, or the remote is not GitHub.
+
+### Checking
+
+`node storiff.js check <dir>` checks `steps.json`.
+A missing change id, a duplicated one, or an unknown file all come back ng.
+This is the only place that confirms all the steps together are the diff you asked for, so run it after editing `owns`.
+
+It checks diagram syntax at the same time: unreadable lines, the old `graph` opener, `->` and `-->>` arrows, and a node name that repeats its label.
+
+## Reading in neovim
+
+With [nvim-storiff](https://github.com/enoatu/nvim-storiff) you can read the same story in neovim.
+
+```
+:Storiff
+```
+
+It opens the real files, so `gd` and `gr` work.
+The outline and narration sit in floating windows on the side, and it opens in its own tab, so the windows you already had stay as they are.
+You can write comments from neovim too.
+
+## Settings
+
+`~/.storiff/config.json` holds defaults.
+
+| Name | What it decides |
+| --- | --- |
+| `host` | the host serve listens on |
+| `exclude` | file patterns to leave out |
+| `generated` | patterns treated as generated files |
+| `with_remote` | whether GitHub PRs and issues are used as material. false by default |
 
 ```json
 {"host": "0.0.0.0"}
 ```
 
-書いておくと、以降 `--host` を付けずに serve するだけで外部からホスト名で見られる。CLI の `--host` を指定した場合はそちらが優先される。0.0.0.0 は届く人全員に差分とコメントが見えるので一時的な用途に限る。
+With this, serving without `--host` is reachable from outside by host name.
+A `--host` on the command line wins over it.
+`0.0.0.0` shows the diff and comments to everyone who can reach you, so keep it to temporary use.
 
-## 使い方
-1. `/storiff` を実行する
-2. すぐにURLが返るので、ブラウザで開いて最初のステップから読み始める。説明文は後ろで埋まっていくので、まだのステップには「準備中」と出る。前に読んだ続きがあれば「続きから読む」ボタンが出る
-3. ステップを読みながら、気になる行かコマ全体かストーリー全体にコメントする。片付いたコメントは解決済みにする
-4. コードを直したら「差分を取り込む」ボタンで直した分をストーリーに追従させる
-5. 「レビュー完了」ボタンを押す
-6. Claudeが会話上でコメントに回答する
+## Files
 
-## ファイル構成
-| ファイル | 役割 |
+| File | Role |
 | --- | --- |
-| `storiff.js` | prep(差分解析)と fill(説明文の埋め戻し)と check(検算)と serve(ビューア配信)と reply(コメントへの返信)を行うNode単一ファイル |
-| `docs/story-schema.md` | データ契約 |
-| `skills/storiff/SKILL.md` | `/storiff` の skill 定義 |
-| `.claude-plugin/plugin.json` | プラグイン定義 |
-| `.claude-plugin/marketplace.json` | marketplace 定義 |
+| `storiff.js` | A single Node file doing prep (diff analysis), fill (writing narrations back), check, serve (the viewer) and reply |
+| `docs/story-schema.md` | The data contract |
+| `skills/storiff/SKILL.md` | The `/storiff` skill definition |
+| `.claude-plugin/plugin.json` | Plugin definition |
+| `.claude-plugin/marketplace.json` | Marketplace definition |
 
-## データ契約
-changes.json と steps.json と story.json や HTTP API の定義、それに各コマンドの細かい決まりは [docs/story-schema.md](docs/story-schema.md) を参照。
+## Data contract
+
+changes.json, steps.json, story.json, the HTTP API, and the finer rules of each command are in [docs/story-schema.md](docs/story-schema.md).
