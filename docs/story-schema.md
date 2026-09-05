@@ -25,7 +25,7 @@ storiff.js(Node単一ファイル)とビューア、skill が共有する契約�
 - `node storiff.js serve <dir> [--port N] [--host H] [--session-id ID]` : ビューアを配信する常駐プロセスを裏で立ち上げ、URLだけすぐ返す。裏のプロセスは changes.json と steps.json を読み、`<dir>/close.flag` で終了する(`done.flag` では止まらない)。ログは `<dir>/serve.log`、起動情報は `<dir>/serve.json`(pid・port・host・url・session_id・started_at)に書く。同じ dir でもう一度実行すると、serve.json の pid が生きていて `/health` に応答すれば新しく起動せず既存のビューアに接続する。このとき `--session-id` を渡すと serve.json の session_id を渡した値に更新する。`--daemon` は裏のプロセス自身が使う内部フラグ。`--session-id` を渡すと、行コメントに haiku がその場で返信する。バインド先は既定 127.0.0.1、`--host 0.0.0.0` で外部からホスト名で見られる
 - バインド先は `~/.storiff/config.json` の `host` でも指定できる(`{"host": "0.0.0.0"}`)。CLI の `--host` が優先
 
-`changes.json` `changes.txt` `files.txt` `hints.txt` `context.txt` `steps.json` `comments.json` `follow.json` `serve.json` `progress.json` はすべて一時ファイルに書いてから同じディレクトリ内で差し替える。書き込みの途中で別プロセスが読みにいっても、壊れた内容を掴むことはない。コミット本文や PR の本文が入るので、ファイルは 0600、`<dir>` は 0700 で作る
+`changes.json` `changes.txt` `files.txt` `hints.txt` `context.txt` `steps.json` `comments.json` `follow.json` `serve.json` `progress.json` `fill.json` はすべて一時ファイルに書いてから同じディレクトリ内で差し替える。書き込みの途中で別プロセスが読みにいっても、壊れた内容を掴むことはない。コミット本文や PR の本文が入るので、ファイルは 0600、`<dir>` は 0700 で作る
 
 依存は Node 組み込みのみ(http, fs, path, child_process, os)。Node 20+。`--session-id` を渡したときの行コメント返信(askHaiku)と `fill` だけは外部の `claude` コマンドを子プロセスで呼ぶ。context.txt を集めるときは `git`、`--with-remote` を付けたときだけ `gh` も子プロセスで呼ぶ。
 
@@ -289,6 +289,7 @@ title だけでは、どれくらいの大きさの差分を、何のために�
 | 分量 | 150文字以内(`FILL_NARRATION_LENGTH_GUIDE`)。1行目に何をしたか、2行目から先になぜを書く |
 | 書き方 | markdown の箇条書き。使えるのは行頭の `- ` と `` `コード` `` と `**強調**` の3つ |
 | 書き戻し | 1件書けるごとに即座に steps.json へ。全部の完了を待たない |
+| 動いている印 | 始めるときに `<dir>/fill.json` へ pid と started_at を書き、終わったら消す。serve は別のプロセスなので、`/status` はこの pid が生きているかを見て答える |
 | 題 | 書き換えない。読んでいる途中で左の目次の並びがずれないようにするため |
 | 子プロセスに許す道具 | `Read,Glob,Grep`(`FILL_ALLOWED_TOOLS`)。材料を読むだけでよい |
 | 1本あたりの待ち時間 | 180秒(`CLAUDE_TIMEOUT_MSEC`)。超えたら止めて空文字を返す。試験では待てないので `STORIFF_CLAUDE_TIMEOUT_MSEC` があればその値を使う |
@@ -392,6 +393,7 @@ CLI から直接 prep を実行する経路と、ビューアの「差分を取�
 | GET | /health | 生存確認。`{"pid": ...}` を返す。serve を2回目に起動したとき既存プロセスの生死を確かめるのに使う |
 | GET | / | ビューアHTML(storiff.js に埋め込み) |
 | GET | /story.json | マージ済みのストーリーと validation と comments |
+| GET | /status | 処理中かどうか。`{"filling": true, "replying": false, "step_total": 12, "step_filled": 7}` を返す。filling は `<dir>/fill.json` の pid が生きているか、replying は haiku が返信を書いている最中か |
 | POST | /comments | コメント追記。`<dir>/comments.json` に追記 |
 | POST | /resolve | コメントの解決済みを切り替える。body は `{"comment_number": 3, "resolved": true}`。番号は comments.json の並び順1始まり |
 | POST | /done | `<dir>/done.flag` を書く。skill はこれを合図に返信する。serve は止めない |

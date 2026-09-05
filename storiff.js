@@ -1660,6 +1660,7 @@ function runFill(targetDir, onDone) {
     .filter((fillTarget) => String(fillTarget.step.narration || "").trim() === "");
   let filledCount = 0;
   const finish = () => {
+    removeFillInfo(targetDir);
     console.log("fill: 説明文が空だった" + fillTargets.length + "ステップのうち" + filledCount + "ステップに書きました");
     if (onDone) onDone(filledCount);
   };
@@ -1667,6 +1668,8 @@ function runFill(targetDir, onDone) {
     finish();
     return;
   }
+  // 書いている間だけ置く印。serve はこの pid を見て、説明文を書いている最中かどうかを答える
+  writeFillInfo(targetDir, { pid: process.pid, started_at: new Date().toISOString() });
   const cwd = resolveCwd(changes);
   let startedCount = 0;
   let finishedCount = 0;
@@ -1768,9 +1771,50 @@ function appendServeLog(targetDir, message) {
   fs.appendFileSync(path.join(targetDir, "serve.log"), message + "\n");
 }
 
+function readFillInfo(targetDir) {
+  return readJson(path.join(targetDir, "fill.json"), null);
+}
+
+function writeFillInfo(targetDir, info) {
+  writeFileAtomic(path.join(targetDir, "fill.json"), JSON.stringify(info, null, 2));
+}
+
+function removeFillInfo(targetDir) {
+  try {
+    fs.unlinkSync(path.join(targetDir, "fill.json"));
+  } catch (error) {
+  }
+}
+
+// fill は serve とは別のプロセスなので、動いているかは書き残した pid を見て決める
+// 途中で死んだ fill は fill.json を消せないため、残っていても pid が死んでいれば動いていない
+function isFillRunning(targetDir) {
+  const fillInfo = readFillInfo(targetDir);
+  if (fillInfo == null || !Number.isInteger(fillInfo.pid)) return false;
+  try {
+    process.kill(fillInfo.pid, 0);
+    return true;
+  } catch (error) {
+    return false;
+  }
+}
+
+// 数え方は runFill が説明文を書く対象と揃える。あと何コマ書くのかを外から見えるようにするため
+function buildStatus(targetDir, replyingCount) {
+  const stepList = readSteps(targetDir).steps;
+  const filledSteps = stepList.filter((step) => String(step.narration || "").trim() !== "");
+  return {
+    filling: isFillRunning(targetDir),
+    replying: replyingCount > 0,
+    step_total: stepList.length,
+    step_filled: filledSteps.length,
+  };
+}
+
 function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
   let isFollowRunning = false;
   let isRebuildRunning = false;
+  let replyingCount = 0;
   const server = http.createServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/health") {
@@ -1784,6 +1828,10 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
       }
       if (request.method === "GET" && request.url === "/story.json") {
         sendJson(response, 200, buildStory(targetDir));
+        return;
+      }
+      if (request.method === "GET" && request.url === "/status") {
+        sendJson(response, 200, buildStatus(targetDir, replyingCount));
         return;
       }
       if (request.method === "POST" && request.url === "/comments") {
@@ -1800,7 +1848,9 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
         }
         sendJson(response, 200, comment);
         if (haikuRequest != null) {
+          replyingCount++;
           askHaiku(haikuRequest.cwd, info.session_id, haikuRequest.prompt, (answer) => {
+            replyingCount--;
             if (answer === "") return;
             appendReply(targetDir, commentNumber, answer);
           });
