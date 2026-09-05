@@ -399,6 +399,7 @@ CLI から直接 prep を実行する経路と、ビューアの「差分を取�
 | GET | / | ビューアHTML(storiff.js に埋め込み) |
 | GET | /story.json | マージ済みのストーリーと validation と comments |
 | GET | /status | 処理中かどうか。`{"filling": true, "replying": false, "step_total": 12, "step_filled": 7}` を返す。filling は `<dir>/fill.json` の pid が生きているか、replying は haiku が返信を書いている最中か |
+| GET | /file | そのコマの時点のファイルの中身。`/file?step=2&path=src/user.js&repo=.` |
 | POST | /comments | コメント追記。`<dir>/comments.json` に追記 |
 | POST | /resolve | コメントの解決済みを切り替える。body は `{"comment_number": 3, "resolved": true}`。番号は comments.json の並び順1始まり |
 | POST | /done | `<dir>/done.flag` を書く。skill はこれを合図に返信する。serve は止めない |
@@ -406,6 +407,20 @@ CLI から直接 prep を実行する経路と、ビューアの「差分を取�
 | POST | /follow | 追従の prep を子プロセスで実行する。すでに実行中なら 409 を返す |
 | POST | /rebuild | steps.json を消して prep --with-draft を子プロセスで実行し直す。コメントは line_text で本文照合して新しい change_id に付け替える。すでに実行中なら 409 を返す |
 | POST | /progress | 読んだ位置を `<dir>/progress.json` に書く。body は `{"current_step_order": 3, "read_step_orders": [1, 2, 3]}` |
+
+GET /file の応答
+```json
+{"content": "function getUser(id) {\n  const user = db.find(id)\n}\n", "status": "modified"}
+```
+変更前のファイル(`base_sha` のコミットの中身)に、コマ1〜step が受け持つ変更だけを当てた中身を返す。
+レビュー画面に作業ツリーの最終形を出すと、1コマ目を読んでいるのに後のコマが足す行まで映るので、その入れ替え用。
+`step` はコマの `order`。0 なら何も当てず変更前そのもの、最大の order なら作業ツリーの中身と一致する。
+`path` は repo からの相対パス。`repo` は省略すると `.`。`status` は changes.json の同じ値をそのまま返す。
+
+- add 行は当てるコマに入っていれば入れ、入っていなければ入れない。del 行は入っていれば消し、入っていなければ残す。context 行はそのまま
+- 新規ファイル(`added`)は変更前が無いので空から始める。改名(`renamed`)は変更前を `old_file` の側から読む
+- コマの並びは当てる順ではない。置き換えが複数のコマに割れていると、途中のコマで旧と新が並ぶような実在しなかった状態になる。仕様として受け入れている
+- 異常時は `{"error": "..."}` を返す。step が数字でない(400)、step が範囲外(400)、path が無い(400)、path に `..` が入る(400)、差分にないファイル(404)、`base_sha` を持たない古い changes.json(409)、変更前の中身を git から読めない(500)
 
 POST /comments の body
 ```json

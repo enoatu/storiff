@@ -4,7 +4,6 @@ node_modules/
 .DS_Store
 CLAUDE.md
 
-tests/
 changes.json
 changes.txt
 files.txt

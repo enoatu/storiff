@@ -69,6 +69,9 @@ const HINT_USE_COUNT_MAX = 20;
 const SERVE_POLL_INTERVAL_MSEC = 200;
 const SERVE_START_TIMEOUT_MSEC = 10000;
 
+// git show でファイル1本を丸ごと読むときの上限。材料集めより大きくなるので git diff と同じところまで許す
+const FILE_CONTENT_BYTE_MAX = 1024 * 1024 * 64;
+
 function readJson(filePath, fallback) {
   if (!fs.existsSync(filePath)) return fallback;
   return JSON.parse(fs.readFileSync(filePath, "utf8"));
@@ -606,6 +609,7 @@ function matchesFilePattern(filePath, patterns) {
 }
 
 // 意図の材料の上限。巨大なPRのコメント欄などで context.txt が膨らみすぎないようにする
+const CONTEXT_COMMAND_OUTPUT_BYTE_MAX = 1024 * 1024 * 8;
 const CONTEXT_COMMAND_TIMEOUT_MSEC = 15000;
 const CONTEXT_COMMIT_BODY_LINE_MAX = 20;
 const CONTEXT_COMMIT_COUNT_MAX = 30;
@@ -629,9 +633,10 @@ const STANDARD_NAMES = ["AES", "CVE", "GMT", "HTTP", "IPV", "ISO", "RFC", "RSA",
 // 一度出した失敗はもう出さない。同じコマンドを何度も呼んだときに同じ1行が並ばないようにする
 const shownCommandFailures = new Set();
 
-function runCommandOrNull(command, commandArgs, cwd) {
+// maxOutputBytes を省くと材料集めの上限になる。ファイルを丸ごと読む用途だけが自分で上限を上げる
+function runCommandOrNull(command, commandArgs, cwd, maxOutputBytes) {
   try {
-    return execFileSync(command, commandArgs, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: CONTEXT_COMMAND_TIMEOUT_MSEC, maxBuffer: 1024 * 1024 * 8 });
+    return execFileSync(command, commandArgs, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: CONTEXT_COMMAND_TIMEOUT_MSEC, maxBuffer: maxOutputBytes == null ? CONTEXT_COMMAND_OUTPUT_BYTE_MAX : maxOutputBytes });
   } catch (error) {
     if (error.code === "ENOENT") return null;
     const reason = (error.stderr ? error.stderr.toString() : String(error.message)).split("\n")[0].trim();
@@ -1472,6 +1477,68 @@ function buildStory(targetDir) {
   };
 }
 
+// 末尾の改行でそのまま切ると空行が1本増えるので、切る前に落とす
+function splitFileLines(text) {
+  if (text === "") return [];
+  return text.replace(/\n$/, "").split("\n");
+}
+
+// 当てる変更IDだけを変更前の中身に反映する
+// lines は差分のかたまりの中しか持たないので、かたまりの間は変更前の行をそのまま送る
+function applyChangeLines(baseLines, diffLines, appliedIds) {
+  const resultLines = [];
+  let baseIndex = 0;
+  for (const line of diffLines) {
+    if (line.old != null) {
+      while (baseIndex < line.old - 1 && baseIndex < baseLines.length) {
+        resultLines.push(baseLines[baseIndex]);
+        baseIndex += 1;
+      }
+    }
+    if (line.kind === "add") {
+      if (appliedIds.has(line.id)) resultLines.push(line.text);
+      continue;
+    }
+    baseIndex += 1;
+    if (line.kind === "del" && appliedIds.has(line.id)) continue;
+    resultLines.push(line.text);
+  }
+  while (baseIndex < baseLines.length) {
+    resultLines.push(baseLines[baseIndex]);
+    baseIndex += 1;
+  }
+  return resultLines;
+}
+
+// コマ1〜N が受け持つ変更だけを当てた、そのコマの時点の中身を返す
+// 作業ツリーの最終形を見せると、1コマ目を読んでいるのに後のコマが足す行まで映ってしまうため
+// コマの並びは当てる順ではないので、置き換えが複数のコマに割れていると途中で実在しなかった状態になる。それは受け入れる
+function buildFileAtStep(targetDir, stepOrderText, filePath, repo) {
+  if (!/^\d+$/.test(stepOrderText)) return { statusCode: 400, body: { error: "step は0以上の整数で指定してください" } };
+  if (filePath === "") return { statusCode: 400, body: { error: "path を指定してください" } };
+  if (filePath.split("/").includes("..")) return { statusCode: 400, body: { error: "path にリポジトリの外は指せません: " + filePath } };
+  const changes = readChanges(targetDir);
+  const file = changes.files.find((candidate) => candidate.file === filePath && candidate.repo === repo);
+  if (file == null) return { statusCode: 404, body: { error: "差分にないファイルです: " + filePath } };
+  const baseSha = (changes.base_sha || {})[repo];
+  if (baseSha == null) return { statusCode: 409, body: { error: "変更前のコミットを覚えていない changes.json です: prep をやり直してください" } };
+  const stepList = readSteps(targetDir).steps;
+  const maxStepOrder = stepList.reduce((largest, step) => Math.max(largest, step.order || 0), 0);
+  const stepOrder = parseInt(stepOrderText, 10);
+  if (stepOrder > maxStepOrder) return { statusCode: 400, body: { error: "step が範囲外です: " + stepOrder + "(最大 " + maxStepOrder + ")" } };
+  // 変更前の中身は改名前のパスにしか無い。新規ファイルはそもそも変更前が無いので空から始める
+  const basePath = file.old_file || file.file;
+  const baseText = file.status === "added" ? "" : runCommandOrNull("git", ["show", baseSha + ":" + basePath], path.resolve(resolveCwd(changes), repo), FILE_CONTENT_BYTE_MAX);
+  if (baseText == null) return { statusCode: 500, body: { error: "変更前の中身を読めません: " + baseSha + ":" + basePath } };
+  const appliedIds = new Set();
+  for (const step of resolveSteps(changes.files, stepList).resolvedSteps) {
+    if ((step.order || 0) > stepOrder) continue;
+    for (const changeId of step.owns) appliedIds.add(changeId);
+  }
+  const resultLines = applyChangeLines(splitFileLines(baseText), file.lines, appliedIds);
+  return { statusCode: 200, body: { content: resultLines.length === 0 ? "" : resultLines.join("\n") + "\n", status: file.status } };
+}
+
 // 行コメントには対象の行の本文を line_text として残す。追従で change_id を写せなくなっても、この本文で行をたどり直せる
 function appendComment(targetDir, body) {
   const commentsPath = path.join(targetDir, "comments.json");
@@ -1871,6 +1938,13 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
       }
       if (request.method === "GET" && request.url === "/status") {
         sendJson(response, 200, buildStatus(targetDir, replyingCount));
+        return;
+      }
+      // クエリを付ける経路はここだけ。ほかは完全一致で見ているので、その形を崩さないよう前半だけを取り出して比べる
+      if (request.method === "GET" && request.url.split("?")[0] === "/file") {
+        const query = new URL(request.url, "http://localhost").searchParams;
+        const fileAtStep = buildFileAtStep(targetDir, query.get("step") || "", query.get("path") || "", query.get("repo") || ".");
+        sendJson(response, fileAtStep.statusCode, fileAtStep.body);
         return;
       }
       if (request.method === "POST" && request.url === "/comments") {
@@ -3811,6 +3885,7 @@ module.exports.fetchPullRequestOrNull = fetchPullRequestOrNull;
 module.exports.resolveSteps = resolveSteps;
 module.exports.buildValidation = buildValidation;
 module.exports.buildStory = buildStory;
+module.exports.buildFileAtStep = buildFileAtStep;
 module.exports.readProgress = readProgress;
 module.exports.writeProgress = writeProgress;
 module.exports.buildUnassignedFileLines = buildUnassignedFileLines;
