@@ -211,12 +211,14 @@ function buildChangesText(files, ownedIds) {
 }
 
 // ファイルごとの1行地図。AIはまずこれを読み、F番号でstepに割り振る
+// 中身を変えずに移しただけのファイルは変更行を持たないので、どこから移したかを書かないと何も伝わらない
 function buildFilesMap(files) {
   const lines = files.map((file, index) => {
     const ids = file.lines.filter((line) => line.id != null).map((line) => line.id);
     const range = ids.length > 0 ? ids[0] + "-" + ids[ids.length - 1] : "-";
     const repoTag = file.repo && file.repo !== "." ? file.repo + " " : "";
-    return "F" + (index + 1) + " [" + range + "] (" + ids.length + ") " + file.status + " " + repoTag + file.file;
+    const movedFrom = file.old_file ? " <- " + file.old_file : "";
+    return "F" + (index + 1) + " [" + range + "] (" + ids.length + ") " + file.status + " " + repoTag + file.file + movedFrom;
   });
   return lines.join("\n") + "\n";
 }
@@ -336,9 +338,22 @@ function buildHintsText(files) {
 }
 
 // 解析に失敗しても prep 全体は止めず、失敗したことを prep の出力と hints.txt の両方に残す
+// 中身を変えずに移しただけのファイルは変更行を持たず、どのコマの owns にも入らない
+// 区切りを決める側からは存在ごと見えないので、手がかりの末尾にまとめて置く
+function buildMovedFilesText(files) {
+  const movedLines = [];
+  for (const file of files) {
+    if (file.status !== "renamed" || file.lines.some((line) => line.id != null)) continue;
+    const repoTag = file.repo && file.repo !== "." ? file.repo + " " : "";
+    movedLines.push(repoTag + file.file + " <- " + repoTag + file.old_file);
+  }
+  if (movedLines.length === 0) return "";
+  return ["", "# 中身を変えずに移しただけのファイル(変更IDは振っていない)", ...movedLines].join("\n") + "\n";
+}
+
 function buildHintsTextOrNote(files) {
   try {
-    return buildHintsText(files);
+    return buildHintsText(files) + buildMovedFilesText(files);
   } catch (error) {
     console.log("手がかりの解析に失敗しました", error);
     return HINT_HEADER + "解析に失敗しました(" + String(error.message).split("\n")[0].trim() + ")\n";
@@ -1485,8 +1500,14 @@ function splitFileLines(text) {
 
 // 当てる変更IDだけを変更前の中身に反映する
 // lines は差分のかたまりの中しか持たないので、かたまりの間は変更前の行をそのまま送る
+// 印を打つ側は作業ツリーの行番号を知っても当てにならないので、当てた結果の行番号も一緒に返す
+// 当てた del は本文が残らないため、消えた場所の直前の行に寄せる。読む側はそこへ消えた行をぶら下げる
+// 先頭で消したときは0。読む側はそこを「1行目より前」として扱う
+// まだ当てていない del はその行がまだ残っているので、その行自身を指す
+// まだ当てていない add はその状態に無いので載せない
 function applyChangeLines(baseLines, diffLines, appliedIds) {
   const resultLines = [];
+  const lineNumberByChangeId = {};
   let baseIndex = 0;
   for (const line of diffLines) {
     if (line.old != null) {
@@ -1496,18 +1517,25 @@ function applyChangeLines(baseLines, diffLines, appliedIds) {
       }
     }
     if (line.kind === "add") {
-      if (appliedIds.has(line.id)) resultLines.push(line.text);
+      if (appliedIds.has(line.id)) {
+        resultLines.push(line.text);
+        if (line.id != null) lineNumberByChangeId[line.id] = resultLines.length;
+      }
       continue;
     }
     baseIndex += 1;
-    if (line.kind === "del" && appliedIds.has(line.id)) continue;
+    if (line.kind === "del" && appliedIds.has(line.id)) {
+      if (line.id != null) lineNumberByChangeId[line.id] = resultLines.length;
+      continue;
+    }
     resultLines.push(line.text);
+    if (line.kind === "del" && line.id != null) lineNumberByChangeId[line.id] = resultLines.length;
   }
   while (baseIndex < baseLines.length) {
     resultLines.push(baseLines[baseIndex]);
     baseIndex += 1;
   }
-  return resultLines;
+  return { lines: resultLines, lineNumberByChangeId: lineNumberByChangeId };
 }
 
 // コマ1〜N が受け持つ変更だけを当てた、そのコマの時点の中身を返す
@@ -1535,8 +1563,15 @@ function buildFileAtStep(targetDir, stepOrderText, filePath, repo) {
     if ((step.order || 0) > stepOrder) continue;
     for (const changeId of step.owns) appliedIds.add(changeId);
   }
-  const resultLines = applyChangeLines(splitFileLines(baseText), file.lines, appliedIds);
-  return { statusCode: 200, body: { content: resultLines.length === 0 ? "" : resultLines.join("\n") + "\n", status: file.status } };
+  const applied = applyChangeLines(splitFileLines(baseText), file.lines, appliedIds);
+  return {
+    statusCode: 200,
+    body: {
+      content: applied.lines.length === 0 ? "" : applied.lines.join("\n") + "\n",
+      status: file.status,
+      lines: applied.lineNumberByChangeId,
+    },
+  };
 }
 
 // 行コメントには対象の行の本文を line_text として残す。追従で change_id を写せなくなっても、この本文で行をたどり直せる
@@ -3861,6 +3896,7 @@ module.exports.setCommentResolved = setCommentResolved;
 module.exports.buildAskPrompt = buildAskPrompt;
 module.exports.askHaiku = askHaiku;
 module.exports.findDefinitionRegexps = findDefinitionRegexps;
+module.exports.buildFilesMap = buildFilesMap;
 module.exports.buildHintsText = buildHintsText;
 module.exports.buildHintsTextOrNote = buildHintsTextOrNote;
 module.exports.buildLineKeyIndex = buildLineKeyIndex;

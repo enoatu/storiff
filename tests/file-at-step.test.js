@@ -182,6 +182,47 @@ test("F4 まだ当てていないコマの変更は入らない", async (testCon
   assert.strictEqual(afterRename.body.content.includes("const secondChanged = 2"), true);
 });
 
+test("F4b 当てた変更IDの行番号を、当てた結果の座標で返す", async (testContext) => {
+  const { changes, port } = await setUp(testContext);
+  const addFifth = findChangeId(changes, "app.js", "add", "const fifth = 5");
+  const addSixth = findChangeId(changes, "app.js", "add", "const sixth = 6");
+  const addSecondChanged = findChangeId(changes, "app.js", "add", "const secondChanged = 2");
+  const delSecond = findChangeId(changes, "app.js", "del", "const second = 2");
+
+  // コマ1では second がまだ残っているので、足した行は5行目に来る
+  // まだ当てていない add はその状態に無いので載らない。まだ当てていない del は行が残っているので載る
+  const atFirst = await getFile(port, "step=1&path=app.js");
+  assert.deepStrictEqual(atFirst.body.lines, { [delSecond]: 2, [addFifth]: 5 });
+
+  const atSecond = await getFile(port, "step=2&path=app.js");
+  assert.deepStrictEqual(atSecond.body.lines, { [delSecond]: 2, [addFifth]: 5, [addSixth]: 6 });
+
+  const atThird = await getFile(port, "step=3&path=app.js");
+  assert.strictEqual(atThird.body.lines[addSecondChanged], 2);
+});
+
+test("F4c 消した行は、当てる前はその行、当てた後は直前の行に寄せる", async (testContext) => {
+  const { changes, port } = await setUp(testContext);
+  const delSecond = findChangeId(changes, "app.js", "del", "const second = 2");
+
+  // コマ2の時点ではまだ消えていないので、その行自身を指す
+  const beforeDelete = await getFile(port, "step=2&path=app.js");
+  assert.strictEqual(beforeDelete.body.lines[delSecond], 2);
+
+  // コマ3で消えると本文が残らないので、消えた場所の直前の行に寄る
+  const afterDelete = await getFile(port, "step=3&path=app.js");
+  assert.strictEqual(afterDelete.body.lines[delSecond], 1);
+});
+
+test("F4d ファイルの先頭で消した行は0を指す", async (testContext) => {
+  const { changes, port } = await setUp(testContext);
+  // gone.js は1行だけのファイルを丸ごと消すので、消えた後に残る行が無い
+  const delGone = findChangeId(changes, "gone.js", "del", "const gone = 1");
+  const afterDelete = await getFile(port, "step=4&path=gone.js");
+  assert.strictEqual(afterDelete.body.content, "");
+  assert.strictEqual(afterDelete.body.lines[delGone], 0);
+});
+
 test("F5 新規ファイルはコマ0で空、当て終わると作業ツリーと一致する", async (testContext) => {
   const { repoDir, port } = await setUp(testContext);
   const beforeAdd = await getFile(port, "step=0&path=born.js");

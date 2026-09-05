@@ -4,7 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
-const { findDefinitionRegexps, buildHintsText, buildHintsTextOrNote, runPrep } = require("../storiff.js");
+const { findDefinitionRegexps, buildFilesMap, buildHintsText, buildHintsTextOrNote, runPrep } = require("../storiff.js");
 
 function makeTempDir(prefix) {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
@@ -142,6 +142,41 @@ test("変更行が多すぎるときは解析を省く", () => {
   for (let index = 1; index <= 100001; index++) manyLines.push(makeLine("add", "const nameOfValue = 1", index));
   const hintsText = buildHintsText([makeFile(".", "src/api.js", manyLines)]);
   assert.match(hintsText, /変更行が多すぎるので解析を省きました/);
+});
+
+// 中身を変えずに移しただけのファイルは変更行を持たず、どのコマの owns にも入らない
+function makeMovedFile(repo, file, oldFile, lines) {
+  return { repo, file, status: "renamed", old_file: oldFile, lines: lines || [] };
+}
+
+test("移しただけのファイルは手がかりの末尾にまとめて出す", () => {
+  const files = [
+    makeFile(".", "src/api.js", [makeLine("add", "function fetchUser(id) {", 1)]),
+    makeMovedFile(".", "src/user.js", "src/models/user.js"),
+    makeMovedFile("libs", "b.js", "a.js"),
+  ];
+  const hintsText = buildHintsTextOrNote(files);
+  assert.match(hintsText, /# 中身を変えずに移しただけのファイル\(変更IDは振っていない\)/);
+  assert.match(hintsText, /src\/user\.js <- src\/models\/user\.js/);
+  assert.match(hintsText, /libs b\.js <- libs a\.js/);
+});
+
+test("移した上で中身も変えたファイルは、変更行から読めるので末尾には出さない", () => {
+  const files = [makeMovedFile(".", "src/user.js", "src/old.js", [makeLine("add", "const changed = 1", 1)])];
+  assert.strictEqual(buildHintsTextOrNote(files).includes("中身を変えずに移しただけ"), false);
+});
+
+test("移しただけのファイルが無ければ末尾の見出しも出ない", () => {
+  const files = [makeFile(".", "src/api.js", [makeLine("add", "function fetchUser(id) {", 1)])];
+  assert.strictEqual(buildHintsTextOrNote(files).includes("中身を変えずに移しただけ"), false);
+});
+
+test("files.txt は改名の旧パスを末尾に出す", () => {
+  const files = [
+    makeFile(".", "other.js", [makeLine("add", "const added = 2", 1)]),
+    makeMovedFile(".", "src/user.js", "src/models/user.js"),
+  ];
+  assert.strictEqual(buildFilesMap(files), "F1 [1-1] (1) modified other.js\nF2 [-] (0) renamed src/user.js <- src/models/user.js\n");
 });
 
 test("解析に失敗したら hints.txt と prep の出力の両方に理由を残す", () => {
