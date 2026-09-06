@@ -8,6 +8,13 @@ const os = require("os");
 // 追従で増えたステップの題。機械が作るので、説明文は空のままになりえる
 const FOLLOW_STEP_TITLE_PATTERN = /^修正\d+回目$/;
 
+// 脇に置いた分をまとめる最後のコマ。意図の話ではないので、コマ送りの一番後ろに置く
+const SUPPORT_STEP_TITLE = "補助";
+
+// 機械が脇に置いたときの理由。人が書いた理由と混ざっても、どちらが書いたか読んで分かるようにする
+const SUPPORT_NOISE_REASON = "ノイズとして自動で脇に置いた";
+const SUPPORT_GENERATED_REASON = "生成コードとして自動で脇に置いた";
+
 // 1stepがおおよそ1時間の作業に収まる目安の変更行数。これを超えるstepは分割の候補
 const CHANGED_LINES_PER_STEP_GUIDE = 80;
 
@@ -558,6 +565,19 @@ function remapSteps(previousFiles, stepList, idMap) {
   });
 }
 
+// 脇に置いた分も追従で変更IDが動く。中身が丸ごと消えた組は理由だけ残っても読めないので落とす
+function remapSupport(previousFiles, support, idMap) {
+  const resolved = resolveSupport(previousFiles, support);
+  return resolved.resolvedSupport
+    .map((entry) => {
+      const owns = entry.owns.map((id) => idMap.get(id)).filter((id) => id != null);
+      const remapped = Object.assign({}, entry, { owns: foldIdsToRanges(owns) });
+      delete remapped.owns_files;
+      return remapped;
+    })
+    .filter((entry) => entry.owns.length > 0);
+}
+
 // scope を持たない古いコメントは行コメントとして扱う
 function commentScope(comment) {
   return comment.scope === "step" || comment.scope === "story" ? comment.scope : "line";
@@ -1016,7 +1036,15 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
   }
   const excludePatterns = NOISE_PATTERNS.concat(config.exclude || []);
   const reviewableFiles = collectedFiles.filter((file) => !matchesFilePattern(file.file, excludePatterns));
-  const excludedCount = collectedFiles.length - reviewableFiles.length;
+  // lockfile は1コミットで数千行動くので中身は持たない。脇に置いたことだけ補助のコマに出す
+  const excludedFiles = collectedFiles.filter((file) => matchesFilePattern(file.file, excludePatterns)).map((file) => ({
+    repo: file.repo,
+    file: file.file,
+    status: file.status,
+    changed_line_count: file.lines.filter((line) => line.kind !== "context").length,
+    reason: SUPPORT_NOISE_REASON,
+  }));
+  const excludedCount = excludedFiles.length;
   const generatedPatterns = GENERATED_PATTERNS.concat(config.generated || []);
   const normalFiles = reviewableFiles.filter((file) => !matchesFilePattern(file.file, generatedPatterns));
   const generatedFiles = reviewableFiles.filter((file) => matchesFilePattern(file.file, generatedPatterns));
@@ -1054,6 +1082,7 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
     base_sha: baseShaByRepo,
     files,
     change_ids: changeIds,
+    excluded_files: excludedFiles,
   };
   const changesText = buildChangesText(files);
   const filesMapText = buildFilesMap(files);
@@ -1068,6 +1097,7 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
 
   let previousComments = null;
   let remappedSteps = null;
+  let remappedSupport = null;
   let idMap = null;
   let lostIds = null;
   let newIds = null;
@@ -1080,9 +1110,14 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
     lostIds = idMapResult.lostIds;
     newIds = idMapResult.newIds;
     remappedSteps = remapSteps(previousChanges.files, previousSteps.steps, idMap);
+    remappedSupport = remapSupport(previousChanges.files, previousSteps.support, idMap);
     const ownedIds = new Set();
     for (const step of resolveSteps(files, remappedSteps).resolvedSteps) {
       for (const id of step.owns) ownedIds.add(id);
+    }
+    // 脇に置いた分を数え落とすと、同じ行が「修正N回目」にも入って重複になる
+    for (const entry of resolveSupport(files, remappedSupport).resolvedSupport) {
+      for (const id of entry.owns) ownedIds.add(id);
     }
     const unownedIds = changeIds.filter((id) => !ownedIds.has(id));
     const fixStepCount = remappedSteps.filter((step) => FOLLOW_STEP_TITLE_PATTERN.test(step.title || "")).length;
@@ -1119,17 +1154,23 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
     console.log("意図の材料: " + contextPath + " (" + materialNotes.join(", ") + ")");
   }
   if (useDraft === true && !hasPreviousSteps) {
-    const draftSteps = buildDraftSteps(files);
+    // 生成コードは意図の話にならないので、下書きの時点で脇に置く。ここに入れた分は fill が説明文を書かない
+    const draftSteps = buildDraftSteps(normalFiles);
+    const draftSupport = generatedFiles.length === 0 ? [] : [{
+      owns_files: generatedFiles.map((file) => file.repo + "::" + file.file),
+      reason: SUPPORT_GENERATED_REASON,
+    }];
     const draftPath = path.join(targetDir, "steps.json");
-    writeFileAtomic(draftPath, JSON.stringify({ title: "", steps: draftSteps }, null, 2));
-    console.log("区切りの下書き: " + draftPath + " (ステップ " + draftSteps.length + "件)。題は仮のままでよく、説明は fill が埋める");
+    writeFileAtomic(draftPath, JSON.stringify({ title: "", steps: draftSteps, support: draftSupport }, null, 2));
+    const supportNote = generatedFiles.length > 0 ? ", 補助 " + generatedFiles.length + "ファイル" : "";
+    console.log("区切りの下書き: " + draftPath + " (ステップ " + draftSteps.length + "件" + supportNote + ")。題は仮のままでよく、説明は fill が埋める");
   }
   if (!isFollow) return;
   if (!isSameAsBefore) {
     const narrationCarry = carryOverNarrations(targetDir, remappedSteps);
     if (narrationCarry.carriedCount > 0) console.log("fill が書いていた説明文" + narrationCarry.carriedCount + "ステップ分を引き継ぎました");
     if (narrationCarry.lostCount > 0) console.log("説明文" + narrationCarry.lostCount + "ステップ分は、追従で居場所が無くなったので消えました。fill が動いている間は差分を取り込まないでください");
-    writeFileAtomic(path.join(targetDir, "steps.json"), JSON.stringify(Object.assign({}, previousSteps, { steps: remappedSteps }), null, 2));
+    writeFileAtomic(path.join(targetDir, "steps.json"), JSON.stringify(Object.assign({}, previousSteps, { steps: remappedSteps, support: remappedSupport }), null, 2));
     writeFileAtomic(path.join(targetDir, "comments.json"), JSON.stringify(remapComments(previousComments, idMap, files), null, 2));
     writeFileAtomic(path.join(targetDir, "follow.json"), JSON.stringify({
       at: new Date().toISOString(),
@@ -1253,11 +1294,30 @@ function resolveSteps(files, steps) {
   return { resolvedSteps, unknownFiles };
 }
 
-function buildValidation(changeIds, files, steps) {
+// 脇に置いた分。owns の書き方はステップと同じで、理由を1本添える
+function resolveSupport(files, support) {
+  const unknownFiles = [];
+  const resolvedSupport = (Array.isArray(support) ? support : []).map((entry) => {
+    const fromOwns = expandStepIds(entry.owns, files);
+    const fromOwnsFiles = expandOwnsFiles(entry.owns_files || [], files);
+    unknownFiles.push(...fromOwns.unknownFiles, ...fromOwnsFiles.unknownFiles);
+    return Object.assign({}, entry, { owns: [...fromOwns.ids, ...fromOwnsFiles.ids], reason: String(entry.reason || "").trim() });
+  });
+  return { resolvedSupport, unknownFiles };
+}
+
+function buildValidation(changeIds, files, steps, support) {
   const resolved = resolveSteps(files, steps);
+  const resolvedSupport = resolveSupport(files, support);
   const ownedCount = new Map();
   for (const step of resolved.resolvedSteps) {
     for (const id of step.owns) {
+      ownedCount.set(id, (ownedCount.get(id) || 0) + 1);
+    }
+  }
+  // 脇に置いた分も居場所が決まったものとして数える。章と両取りしていれば重複として出る
+  for (const entry of resolvedSupport.resolvedSupport) {
+    for (const id of entry.owns) {
       ownedCount.set(id, (ownedCount.get(id) || 0) + 1);
     }
   }
@@ -1266,8 +1326,9 @@ function buildValidation(changeIds, files, steps) {
   for (const [id, count] of ownedCount) {
     if (count > 1) duplicated.push(id);
   }
-  const ok = missing.length === 0 && duplicated.length === 0 && resolved.unknownFiles.length === 0;
-  return { ok, missing, duplicated, unknown_files: resolved.unknownFiles, resolvedSteps: resolved.resolvedSteps };
+  const unknownFiles = [...resolved.unknownFiles, ...resolvedSupport.unknownFiles];
+  const ok = missing.length === 0 && duplicated.length === 0 && unknownFiles.length === 0;
+  return { ok, missing, duplicated, unknown_files: unknownFiles, resolvedSteps: resolved.resolvedSteps, resolvedSupport: resolvedSupport.resolvedSupport };
 }
 
 function buildUnassignedFileLines(files, missingIds) {
@@ -1318,6 +1379,15 @@ function buildStepRisksIssues(stepList) {
     const order = step.order != null ? step.order : index + 1;
     if (!Array.isArray(step.risks)) issues.push("step" + order + " risks が配列になっていません");
     else if (countFilledItems(step.risks) === 0) issues.push("step" + order + " risks が空だけです。無いなら risks ごと消す");
+  });
+  return issues;
+}
+
+// 理由の無い support は、脇に置いたのか入れ忘れたのか読み手に見分けが付かない
+function buildSupportIssues(resolvedSupport) {
+  const issues = [];
+  resolvedSupport.forEach((entry, index) => {
+    if (entry.reason === "") issues.push("support" + (index + 1) + " reason が空です。なぜ章に入れないのかを1行で書く");
   });
   return issues;
 }
@@ -1477,18 +1547,32 @@ function writeProgress(targetDir, body) {
   return progress;
 }
 
+// 脇に置いた分を最後の1コマにまとめる。行を持たない除外ファイルは、名前と行数だけ説明文に載せる
+function buildSupportStep(resolvedSupport, excludedFiles, steps) {
+  const ownedIds = [];
+  for (const entry of resolvedSupport) ownedIds.push(...entry.owns);
+  const notes = resolvedSupport.filter((entry) => entry.reason !== "").map((entry) => "- " + entry.reason);
+  for (const file of excludedFiles || []) notes.push("- `" + file.file + "` " + file.changed_line_count + "行 " + file.reason);
+  if (ownedIds.length === 0 && notes.length === 0) return null;
+  const maxOrder = steps.reduce((largest, step) => Math.max(largest, step.order || 0), 0);
+  // 説明文が空だとビューアが「書いている最中」と出すので、理由が1つも無いときも1行は書く
+  const narration = notes.length > 0 ? notes.join("\n") : "- 章に入れずに脇へ置いた分";
+  return { order: maxOrder + 1, title: SUPPORT_STEP_TITLE, narration, owns: ownedIds, refs: [], is_support: true };
+}
+
 function buildStory(targetDir) {
   if (!fs.existsSync(path.join(targetDir, "changes.json"))) throw new Error("changes.json がありません: 先に prep を実行してください");
   const changes = readChanges(targetDir);
   const steps = readSteps(targetDir);
   const comments = readJson(path.join(targetDir, "comments.json"), []);
-  const validation = buildValidation(changes.change_ids, changes.files, steps.steps);
+  const validation = buildValidation(changes.change_ids, changes.files, steps.steps, steps.support);
+  const supportStep = buildSupportStep(validation.resolvedSupport, changes.excluded_files, validation.resolvedSteps);
   return {
     title: steps.title || "",
     overview: steps.overview || null,
     files: changes.files,
     change_ids: changes.change_ids,
-    steps: validation.resolvedSteps,
+    steps: supportStep == null ? validation.resolvedSteps : [...validation.resolvedSteps, supportStep],
     validation: { ok: validation.ok, missing: validation.missing, duplicated: validation.duplicated, unknown_files: validation.unknown_files },
     comments,
     progress: readProgress(targetDir),
@@ -2220,6 +2304,7 @@ var PROGRESS_SAVE_DELAY_MSEC=1500;
 var WORD_DIFF_SIMILARITY_MIN=0.75;
 var NARRATION_PENDING_TEXT='説明文をいま書いています。書けたコマから自動で出ます';
 var STEP_PENDING_LABEL='準備中';
+var SUPPORT_STEP_TITLE='補助';
 var COMMENT_LINE_LOST_TEXT='元の行が見つかりません。別の場所を指しているかもしれません';
 // 機械が作るステップの題。fill が説明文を書かないので、空でも準備中とは出さない
 var FOLLOW_STEP_TITLE_PATTERN=/^修正\\d+回目$/;
@@ -2263,6 +2348,8 @@ function commentKey(file, changeId){return file + '#' + changeId;}
 function stepNumber(step, index){return step.order!=null?step.order:index+1;}
 function isNarrationPending(step){
   if(step==null||String(step.narration||'').trim()!=='') return false;
+  // 補助も fill が触らないので、空でも書いている最中とは出さない
+  if(step.is_support===true) return false;
   return !FOLLOW_STEP_TITLE_PATTERN.test(step.title||'');
 }
 function markCurrentStepRead(){
@@ -2334,7 +2421,7 @@ function renderStepList(){
     item.className='step-item'+(index===stepIndex?' active':'')+(readStepOrders[stepNumber(step, index)]===true?' read':'');
     var numberLabel=document.createElement('span');
     numberLabel.className='step-num';
-    numberLabel.textContent=index+1;
+    numberLabel.textContent=step.is_support?'S':index+1;
     var titleLabel=document.createElement('span');
     titleLabel.className='step-item-title';
     titleLabel.textContent=step.title;
@@ -3253,7 +3340,9 @@ function render(){
   var isPending=isNarrationPending(step);
   narrationBox.className=isPending?'narration pending':'narration';
   renderMarkdown(narrationBox, isPending?NARRATION_PENDING_TEXT:(step?step.narration:''));
-  document.getElementById('counter').textContent='Step '+(step?stepNumber(step, stepIndex):0)+' / '+story.steps.length;
+  // 補助は意図の話ではないので、コマ数の分母から外して「3コマ読む」という見え方を崩さない
+  var storyStepCount=story.steps.filter(function(candidate){return candidate.is_support!==true;}).length;
+  document.getElementById('counter').textContent=step&&step.is_support?SUPPORT_STEP_TITLE:'Step '+(step?stepNumber(step, stepIndex):0)+' / '+storyStepCount;
   document.getElementById('prevBtn').disabled=stepIndex<=0;
   document.getElementById('nextBtn').disabled=!canGoNext();
   renderStepList();
@@ -3711,11 +3800,11 @@ function main() {
     }
     const changes = readChanges(targetDir);
     const steps = readSteps(targetDir);
-    const validation = buildValidation(changes.change_ids, changes.files, steps.steps);
+    const validation = buildValidation(changes.change_ids, changes.files, steps.steps, steps.support);
     if (!validation.ok) {
       console.log("ng:");
       if (validation.missing.length > 0) {
-        console.log("  未割り当てのファイル(どこかのstepに足す):");
+        console.log("  未割り当てのファイル(どこかのstepに足すか、章に入れないなら理由を添えて support に置く):");
         for (const line of buildUnassignedFileLines(changes.files, validation.missing)) console.log("    " + line);
       }
       if (validation.duplicated.length > 0) console.log("  重複した変更ID " + validation.duplicated.length + "件: " + validation.duplicated.slice(0, 50).join(","));
@@ -3753,7 +3842,9 @@ function main() {
     }
     const diagramStepCount = steps.steps.filter((step) => step.diagram != null && String(step.diagram).trim() !== "").length;
     const diagramNote = diagramStepCount > 0 ? "(図 " + diagramStepCount + "枚)" : "";
-    console.log("ok: 全" + changes.change_ids.length + "件の変更IDがちょうど1回ずつ owns に入っています" + diagramNote);
+    const supportIdCount = validation.resolvedSupport.reduce((total, entry) => total + entry.owns.length, 0);
+    const supportNote = supportIdCount > 0 ? "(うち補助 " + supportIdCount + "件)" : "";
+    console.log("ok: 全" + changes.change_ids.length + "件の変更IDがちょうど1回ずつ owns に入っています" + supportNote + diagramNote);
     if (advisory.length > 0) {
       console.log("参考 目安 " + stepSizeGuide + "行を超えるstep(浅く広い機械的変更や自動生成物ならこのままでよい。密な実装なら分割を検討)");
       for (const step of advisory) {
@@ -3773,6 +3864,11 @@ function main() {
     if (stepRisksIssues.length > 0) {
       console.log("参考 気をつける点の作り(この形だと書いても画面に出ない)");
       for (const issue of stepRisksIssues) console.log("  " + issue);
+    }
+    const supportIssues = buildSupportIssues(validation.resolvedSupport);
+    if (supportIssues.length > 0) {
+      console.log("参考 脇に置いた分の理由(補助のコマにそのまま出る)");
+      for (const issue of supportIssues) console.log("  " + issue);
     }
     return;
   }
@@ -3903,6 +3999,7 @@ module.exports.buildLineKeyIndex = buildLineKeyIndex;
 module.exports.buildIdMap = buildIdMap;
 module.exports.foldIdsToRanges = foldIdsToRanges;
 module.exports.remapSteps = remapSteps;
+module.exports.remapSupport = remapSupport;
 module.exports.remapComments = remapComments;
 module.exports.runPrep = runPrep;
 module.exports.runRebuild = runRebuild;
@@ -3919,6 +4016,7 @@ module.exports.collectDocPaths = collectDocPaths;
 module.exports.buildContextText = buildContextText;
 module.exports.fetchPullRequestOrNull = fetchPullRequestOrNull;
 module.exports.resolveSteps = resolveSteps;
+module.exports.resolveSupport = resolveSupport;
 module.exports.buildValidation = buildValidation;
 module.exports.buildStory = buildStory;
 module.exports.buildFileAtStep = buildFileAtStep;
@@ -3927,6 +4025,7 @@ module.exports.writeProgress = writeProgress;
 module.exports.buildUnassignedFileLines = buildUnassignedFileLines;
 module.exports.buildOverviewIssues = buildOverviewIssues;
 module.exports.buildStepRisksIssues = buildStepRisksIssues;
+module.exports.buildSupportIssues = buildSupportIssues;
 module.exports.parseDiagram = parseDiagram;
 module.exports.buildDiagramValidation = buildDiagramValidation;
 module.exports.resolveBaseRef = resolveBaseRef;

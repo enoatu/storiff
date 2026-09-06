@@ -85,7 +85,7 @@ test("欠落した変更IDがあると ng になり、未割り当てのファ�
   const before = fs.readFileSync(path.join(targetDir, "steps.json"), "utf8");
   const result = runCheck(targetDir, []);
   assert.strictEqual(result.exitCode, 1);
-  assert.ok(result.output.includes("未割り当てのファイル(どこかのstepに足す):"));
+  assert.ok(result.output.includes("未割り当てのファイル(どこかのstepに足すか、章に入れないなら理由を添えて support に置く):"));
   assert.ok(result.output.includes("F2 b.js (id 4)"));
   assert.strictEqual(fs.readFileSync(path.join(targetDir, "steps.json"), "utf8"), before);
 });

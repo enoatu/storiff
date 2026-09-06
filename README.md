@@ -280,8 +280,8 @@ You can write comments from neovim too.
 | Name | What it decides |
 | --- | --- |
 | `host` | the host serve listens on |
-| `exclude` | file patterns to leave out |
-| `generated` | patterns treated as generated files |
+| `exclude` | file patterns to leave out. no lines are kept, only the name and line count show up in the support step |
+| `generated` | patterns treated as generated files. moved into support when the draft is built |
 | `with_remote` | whether GitHub PRs and issues are used as material. false by default |
 
 ```json
