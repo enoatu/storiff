@@ -158,7 +158,8 @@ test("移しただけのファイルは手がかりの末尾にまとめて出�
   const hintsText = buildHintsTextOrNote(files);
   assert.match(hintsText, /# 中身を変えずに移しただけのファイル\(変更IDは振っていない\)/);
   assert.match(hintsText, /src\/user\.js <- src\/models\/user\.js/);
-  assert.match(hintsText, /libs b\.js <- libs a\.js/);
+  // 改名は同じリポジトリの中で起きるので、旧パス側にリポジトリ名は付けない
+  assert.match(hintsText, /libs b\.js <- a\.js/);
 });
 
 test("移した上で中身も変えたファイルは、変更行から読めるので末尾には出さない", () => {

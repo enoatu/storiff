@@ -418,14 +418,14 @@ CLI から直接 prep を実行する経路と、ビューアの「差分を取�
 
 GET /file の応答
 ```json
-{"content": "function getUser(id) {\n  const user = db.find(id)\n}\n", "status": "modified", "lines": {"12": 2, "13": 3}}
+{"content": "function getUser(id) {\n  const user = db.find(id)\n}\n", "status": "modified", "line_numbers": {"12": 2, "13": 3}}
 ```
 変更前のファイル(`base_sha` のコミットの中身)に、コマ1〜step が受け持つ変更だけを当てた中身を返す。
 レビュー画面に作業ツリーの最終形を出すと、1コマ目を読んでいるのに後のコマが足す行まで映るので、その入れ替え用。
 `step` はコマの `order`。0 なら何も当てず変更前そのもの、最大の order なら作業ツリーの中身と一致する。
 `path` は repo からの相対パス。`repo` は省略すると `.`。`status` は changes.json の同じ値をそのまま返す。
 
-`lines` は変更IDから、当てた結果での行番号(1始まり)を引く表。changes.json の `new` は作業ツリーの座標なので、
+`line_numbers` は変更IDから、当てた結果での行番号(1始まり)を引く表。changes.json の `new` は作業ツリーの座標なので、
 コマの途中の中身に印を打つときはこちらを使う。載る条件は次のとおり。
 
 | 行の種類 | 当てるコマに入っている | 入っていない |

@@ -217,7 +217,7 @@ function buildFilesMap(files) {
     const ids = file.lines.filter((line) => line.id != null).map((line) => line.id);
     const range = ids.length > 0 ? ids[0] + "-" + ids[ids.length - 1] : "-";
     const repoTag = file.repo && file.repo !== "." ? file.repo + " " : "";
-    const movedFrom = file.old_file ? " <- " + file.old_file : "";
+    const movedFrom = file.old_file != null ? " <- " + file.old_file : "";
     return "F" + (index + 1) + " [" + range + "] (" + ids.length + ") " + file.status + " " + repoTag + file.file + movedFrom;
   });
   return lines.join("\n") + "\n";
@@ -337,27 +337,30 @@ function buildHintsText(files) {
   return HINT_HEADER + hintLines.join("\n") + "\n";
 }
 
-// 解析に失敗しても prep 全体は止めず、失敗したことを prep の出力と hints.txt の両方に残す
 // 中身を変えずに移しただけのファイルは変更行を持たず、どのコマの owns にも入らない
 // 区切りを決める側からは存在ごと見えないので、手がかりの末尾にまとめて置く
 function buildMovedFilesText(files) {
-  const movedLines = [];
+  const movedFileLines = [];
   for (const file of files) {
-    if (file.status !== "renamed" || file.lines.some((line) => line.id != null)) continue;
+    if (file.status !== "renamed" || file.old_file == null) continue;
+    if (file.lines.some((line) => line.id != null)) continue;
     const repoTag = file.repo && file.repo !== "." ? file.repo + " " : "";
-    movedLines.push(repoTag + file.file + " <- " + repoTag + file.old_file);
+    movedFileLines.push(repoTag + file.file + " <- " + file.old_file);
   }
-  if (movedLines.length === 0) return "";
-  return ["", "# 中身を変えずに移しただけのファイル(変更IDは振っていない)", ...movedLines].join("\n") + "\n";
+  if (movedFileLines.length === 0) return "";
+  return ["", "# 中身を変えずに移しただけのファイル(変更IDは振っていない)", ...movedFileLines].join("\n") + "\n";
 }
 
+// 解析に失敗しても prep 全体は止めず、失敗したことを prep の出力と hints.txt の両方に残す
 function buildHintsTextOrNote(files) {
+  let hintsText;
   try {
-    return buildHintsText(files) + buildMovedFilesText(files);
+    hintsText = buildHintsText(files);
   } catch (error) {
     console.log("手がかりの解析に失敗しました", error);
     return HINT_HEADER + "解析に失敗しました(" + String(error.message).split("\n")[0].trim() + ")\n";
   }
+  return hintsText + buildMovedFilesText(files);
 }
 
 function buildLineKey(file, line) {
@@ -1501,10 +1504,7 @@ function splitFileLines(text) {
 // 当てる変更IDだけを変更前の中身に反映する
 // lines は差分のかたまりの中しか持たないので、かたまりの間は変更前の行をそのまま送る
 // 印を打つ側は作業ツリーの行番号を知っても当てにならないので、当てた結果の行番号も一緒に返す
-// 当てた del は本文が残らないため、消えた場所の直前の行に寄せる。読む側はそこへ消えた行をぶら下げる
-// 先頭で消したときは0。読む側はそこを「1行目より前」として扱う
-// まだ当てていない del はその行がまだ残っているので、その行自身を指す
-// まだ当てていない add はその状態に無いので載せない
+// 変更IDごとに何行目を指すかは docs/story-schema.md の GET /file の表にまとめてある
 function applyChangeLines(baseLines, diffLines, appliedIds) {
   const resultLines = [];
   const lineNumberByChangeId = {};
@@ -1563,13 +1563,13 @@ function buildFileAtStep(targetDir, stepOrderText, filePath, repo) {
     if ((step.order || 0) > stepOrder) continue;
     for (const changeId of step.owns) appliedIds.add(changeId);
   }
-  const applied = applyChangeLines(splitFileLines(baseText), file.lines, appliedIds);
+  const appliedFile = applyChangeLines(splitFileLines(baseText), file.lines, appliedIds);
   return {
     statusCode: 200,
     body: {
-      content: applied.lines.length === 0 ? "" : applied.lines.join("\n") + "\n",
+      content: appliedFile.lines.length === 0 ? "" : appliedFile.lines.join("\n") + "\n",
       status: file.status,
-      lines: applied.lineNumberByChangeId,
+      line_numbers: appliedFile.lineNumberByChangeId,
     },
   };
 }
