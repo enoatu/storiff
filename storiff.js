@@ -73,6 +73,8 @@ const HINT_NAME_LENGTH_MIN = 3;
 
 const HINT_USE_COUNT_MAX = 20;
 
+// 置き場ごと消された serve に投げられたときの返事。作り直す元も取り込む先も無いので断る
+const SERVE_DIR_GONE_TEXT = "置き場が消えています。storiff を立て直してください";
 const SERVE_POLL_INTERVAL_MSEC = 200;
 const SERVE_START_TIMEOUT_MSEC = 10000;
 
@@ -2114,6 +2116,10 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
           sendJson(response, 409, { started: false, error: "差分の取り込みが実行中です" });
           return;
         }
+        if (!fs.existsSync(targetDir)) {
+          sendJson(response, 410, { started: false, error: SERVE_DIR_GONE_TEXT });
+          return;
+        }
         let logFd;
         try {
           logFd = fs.openSync(path.join(targetDir, "serve.log"), "a");
@@ -2154,6 +2160,10 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
       if (request.method === "POST" && request.url === "/rebuild") {
         if (isRebuildRunning) {
           sendJson(response, 409, { started: false, error: "区切りの作り直しが実行中です" });
+          return;
+        }
+        if (!fs.existsSync(targetDir)) {
+          sendJson(response, 410, { started: false, error: SERVE_DIR_GONE_TEXT });
           return;
         }
         let logFd;
@@ -2216,6 +2226,15 @@ function runServeDaemon(targetDir, requestedPort, bindHost, sessionId) {
 
   const closePath = path.join(targetDir, "close.flag");
   const watcher = setInterval(() => {
+    // 置き場ごと消されると終わりの合図を置く先が無くなる。自分で気づいて終わらないとポートを掴んだまま残り続ける
+    if (!fs.existsSync(targetDir)) {
+      console.log("置き場が無くなりました。サーバを終了します");
+      clearInterval(watcher);
+      server.close(() => {
+        process.exit(0);
+      });
+      return;
+    }
     if (fs.existsSync(closePath)) {
       console.log("終了の合図を検知しました。サーバを終了します");
       clearInterval(watcher);

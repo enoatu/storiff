@@ -73,6 +73,19 @@ async function waitForHealth(port, timeoutMsec) {
   return false;
 }
 
+async function waitForServeGone(port, timeoutMsec) {
+  const deadline = Date.now() + timeoutMsec;
+  while (Date.now() < deadline) {
+    try {
+      await httpGet(port, "/health", 500);
+    } catch (error) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 100));
+  }
+  return false;
+}
+
 // 死んだ pid を数字で決め打ちすると、たまたま動いている別のプロセスに当たる。終わらせた子プロセスの pid を使う
 function makeFinishedPid() {
   return new Promise((resolve) => {
@@ -167,4 +180,44 @@ test("E2 /status が説明文の進みと、fill が動いているかどうか�
   fs.writeFileSync(fillInfoPath, JSON.stringify({ pid: await makeFinishedPid(), started_at: new Date().toISOString() }));
   const afterFillDied = await httpGet(serveInfo.port, "/status", 2000);
   assert.strictEqual(JSON.parse(afterFillDied.body).filling, false, "死んだ pid が残っていると書いている最中に見えました");
+});
+
+test("E3 置き場ごと消されたら、作り直しと取り込みを断ってから自分で終わる", async (t) => {
+  const targetDir = makeTempDir("storiff-gone-");
+
+  fs.writeFileSync(path.join(targetDir, "changes.json"), JSON.stringify({
+    files: [{ repo: ".", file: "a.js", status: "modified", lines: [{ kind: "add", old: null, new: 1, text: "line1", id: 1 }] }],
+    change_ids: [1],
+    cwd: targetDir,
+  }));
+
+  const child = spawn(
+    process.execPath,
+    [path.join(__dirname, "..", "storiff.js"), "serve", targetDir, "--daemon", "--host", "127.0.0.1", "--port", "0", "--session-id", "dummy-session-for-test"],
+    { stdio: "ignore" },
+  );
+  t.after(() => {
+    try {
+      child.kill();
+    } catch (error) {
+    }
+    fs.rmSync(targetDir, { recursive: true, force: true });
+  });
+
+  const serveInfo = await waitForServeInfo(targetDir, 5000);
+  assert.ok(serveInfo, "serve.json が書き出されませんでした");
+  const started = await waitForHealth(serveInfo.port, 5000);
+  assert.strictEqual(started, true, "serve が起動しませんでした");
+
+  fs.rmSync(targetDir, { recursive: true, force: true });
+
+  const rebuildResponse = await httpPostJson(serveInfo.port, "/rebuild", {}, 2000);
+  assert.strictEqual(rebuildResponse.statusCode, 410, "作り直しが断られませんでした");
+  assert.match(rebuildResponse.body, /置き場が消えています/);
+
+  const followResponse = await httpPostJson(serveInfo.port, "/follow", {}, 2000);
+  assert.strictEqual(followResponse.statusCode, 410, "取り込みが断られませんでした");
+
+  const gone = await waitForServeGone(serveInfo.port, 5000);
+  assert.strictEqual(gone, true, "置き場が消えてもサーバが終わりませんでした");
 });
