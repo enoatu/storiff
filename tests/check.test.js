@@ -62,6 +62,15 @@ function writeSteps(targetDir, steps) {
   fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify({ title: "題名", steps }));
 }
 
+// prep --with-draft を実行した直後と同じ、区切りが下書きのままの steps.json を置く
+function writeDraftSteps(targetDir, steps) {
+  fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify({ title: "", is_draft: true, steps }));
+}
+
+function readIsDraft(targetDir) {
+  return JSON.parse(fs.readFileSync(path.join(targetDir, "steps.json"), "utf8")).is_draft;
+}
+
 // check を叩く。戻り値は終了コードと出力
 function runCheck(targetDir, options) {
   try {
@@ -194,4 +203,37 @@ test("無くなった --strict と --backfill を付けても既定のまま動�
   const result = runCheck(targetDir, ["--strict", "--backfill"]);
   assert.strictEqual(result.exitCode, 0);
   assert.strictEqual(result.output, "ok: 全4件の変更IDがちょうど1回ずつ owns に入っています\n");
+});
+
+test("ok になると下書きの印が外れる", (t) => {
+  const targetDir = makeTempDir("storiff-check-");
+  t.after(() => fs.rmSync(targetDir, { recursive: true, force: true }));
+
+  writeChanges(targetDir);
+  writeDraftSteps(targetDir, [makeStep(1, "1つ目", [1, 2]), makeStep(2, "2つ目", [3, 4])]);
+  const result = runCheck(targetDir, []);
+  assert.strictEqual(result.exitCode, 0);
+  assert.strictEqual(readIsDraft(targetDir), false);
+});
+
+test("ng のときは下書きの印が残る", (t) => {
+  const targetDir = makeTempDir("storiff-check-");
+  t.after(() => fs.rmSync(targetDir, { recursive: true, force: true }));
+
+  writeChanges(targetDir);
+  writeDraftSteps(targetDir, [makeStep(1, "1つ目", [1, 2])]);
+  const result = runCheck(targetDir, []);
+  assert.strictEqual(result.exitCode, 1);
+  assert.strictEqual(readIsDraft(targetDir), true);
+});
+
+test("清書済みの steps.json に check を通しても印は付かない", (t) => {
+  const targetDir = makeTempDir("storiff-check-");
+  t.after(() => fs.rmSync(targetDir, { recursive: true, force: true }));
+
+  writeChanges(targetDir);
+  writeSteps(targetDir, [makeStep(1, "1つ目", [1, 2]), makeStep(2, "2つ目", [3, 4])]);
+  const result = runCheck(targetDir, []);
+  assert.strictEqual(result.exitCode, 0);
+  assert.strictEqual(readIsDraft(targetDir), undefined);
 });

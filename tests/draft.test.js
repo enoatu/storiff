@@ -176,6 +176,7 @@ test("--with-draft で書いた下書きが check を通る", (t) => {
 
   const steps = JSON.parse(fs.readFileSync(path.join(targetDir, "steps.json"), "utf8"));
   assert.strictEqual(steps.title, "");
+  assert.strictEqual(steps.is_draft, true);
   assert.strictEqual(steps.steps.length, 3);
   assert.ok(steps.steps.every((step) => step.narration === ""));
   assert.deepStrictEqual(steps.steps.map((step) => step.title),
@@ -184,6 +185,7 @@ test("--with-draft で書いた下書きが check を通る", (t) => {
   const checkResult = runStoriff(["check", targetDir], repoDir);
   assert.strictEqual(checkResult.exitCode, 0, checkResult.output);
   assert.ok(checkResult.output.startsWith("ok: 全121件の変更IDがちょうど1回ずつ owns に入っています"), checkResult.output);
+  assert.strictEqual(JSON.parse(fs.readFileSync(path.join(targetDir, "steps.json"), "utf8")).is_draft, false);
 });
 
 test("--with-draft を付けなければ steps.json は作らない", (t) => {

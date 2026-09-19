@@ -199,6 +199,7 @@ steps.json に書き込むのは、同じ時間にはどれか1か所だけに�
 }
 ```
 - overview: ストーリーの全体像。任意。詳しくは「全体像」を参照
+- is_draft: 区切りと題が下書きのままかどうか。`prep --with-draft` が true で書き、`check` が ok を出したときに storiff.js が false にする。手で書き換えない。true の間はビューアが題の代わりに仮の表示を出し、コマ数の分母も出さない
 - support: 章に入れずに脇へ置いた分。任意。詳しくは「脇に置いた分(support)」を参照
 - owns: このステップが所有する変更ID。同じIDを2つのステップが持ってはいけない(不変条件)。次の3種を混ぜて書ける
   - F番号 `"F12"` そのファイル1つ丸ごと
@@ -409,6 +410,7 @@ CLI から直接 prep を実行する経路と、ビューアの「差分を取�
 ```json
 {
   "title": "...",
+  "is_draft": false,
   "overview": {"summary": "...", "key_changes": ["..."], "risks": ["..."]},
   "files": [ ... ],
   "change_ids": [ ... ],
@@ -420,6 +422,7 @@ CLI から直接 prep を実行する経路と、ビューアの「差分を取�
 ```
 - serve は owns の和集合が change_ids と一致するか検算し validation に入れる。不一致でも配信はする
 - overview と steps の中身は steps.json のまま渡る。overview が steps.json に無ければ null
+- is_draft は steps.json に無ければ false。true の間は、ビューアが題の代わりに仮の表示を出し、コマ数の分母も出さない
 - support は steps の末尾に `{"title": "補助", "is_support": true}` の1コマとして足して渡す。
   受け取る側は普通のコマとして描けばよく、`is_support` を見て通し番号を `S` に変えるだけでよい。
   support も excluded_files も無いときは足さない

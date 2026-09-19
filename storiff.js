@@ -112,6 +112,14 @@ function cleanupStaleTempFiles(targetDir) {
   }
 }
 
+// 区切りと題が下書きのままかどうか。check が ok を出すまでは、画面に仮の表示が出る
+function clearDraftMark(targetDir) {
+  const steps = readSteps(targetDir);
+  if (steps.is_draft !== true) return;
+  steps.is_draft = false;
+  writeFileAtomic(path.join(targetDir, "steps.json"), JSON.stringify(steps, null, 2));
+}
+
 function loadConfig() {
   return readJson(path.join(os.homedir(), ".storiff", "config.json"), {});
 }
@@ -1163,7 +1171,7 @@ function runPrep(targetDir, repoList, hasExplicitArgs, useRemote, useDraft) {
       reason: SUPPORT_GENERATED_REASON,
     }];
     const draftPath = path.join(targetDir, "steps.json");
-    writeFileAtomic(draftPath, JSON.stringify({ title: "", steps: draftSteps, support: draftSupport }, null, 2));
+    writeFileAtomic(draftPath, JSON.stringify({ title: "", is_draft: true, steps: draftSteps, support: draftSupport }, null, 2));
     const supportNote = generatedFiles.length > 0 ? ", 補助 " + generatedFiles.length + "ファイル" : "";
     console.log("区切りの下書き: " + draftPath + " (ステップ " + draftSteps.length + "件" + supportNote + ")。題は仮のままでよく、説明は fill が埋める");
   }
@@ -1571,6 +1579,7 @@ function buildStory(targetDir) {
   const supportStep = buildSupportStep(validation.resolvedSupport, changes.excluded_files, validation.resolvedSteps);
   return {
     title: steps.title || "",
+    is_draft: steps.is_draft === true,
     overview: steps.overview || null,
     files: changes.files,
     change_ids: changes.change_ids,
@@ -2324,6 +2333,9 @@ var WORD_DIFF_SIMILARITY_MIN=0.75;
 var NARRATION_PENDING_TEXT='説明文をいま書いています。書けたコマから自動で出ます';
 var STEP_PENDING_LABEL='準備中';
 var SUPPORT_STEP_TITLE='補助';
+// 区切りが下書きのままの間に出す題。清書でコマ数まで変わるので、分母は数を出さない
+var DRAFT_TITLE_TEXT='仮の表示です。AI が構成を考えています…';
+var DRAFT_STEP_COUNT_TEXT='…';
 var COMMENT_LINE_LOST_TEXT='元の行が見つかりません。別の場所を指しているかもしれません';
 // 機械が作るステップの題。fill が説明文を書かないので、空でも準備中とは出さない
 var FOLLOW_STEP_TITLE_PATTERN=/^修正\\d+回目$/;
@@ -3353,7 +3365,8 @@ function goToStep(nextIndex){resumeStepOrder=null;stepIndex=nextIndex;render();s
 function render(){
   var step=story.steps[stepIndex];
   markCurrentStepRead();
-  document.getElementById('storyTitle').textContent=story.title||'storiff';
+  var isDraft=story.is_draft===true;
+  document.getElementById('storyTitle').textContent=isDraft?DRAFT_TITLE_TEXT:(story.title||'storiff');
   document.getElementById('stepTitle').textContent=step?step.title:'ステップがありません';
   var narrationBox=document.getElementById('narration');
   var isPending=isNarrationPending(step);
@@ -3361,7 +3374,8 @@ function render(){
   renderMarkdown(narrationBox, isPending?NARRATION_PENDING_TEXT:(step?step.narration:''));
   // 補助は意図の話ではないので、コマ数の分母から外して「3コマ読む」という見え方を崩さない
   var storyStepCount=story.steps.filter(function(candidate){return candidate.is_support!==true;}).length;
-  document.getElementById('counter').textContent=step&&step.is_support?SUPPORT_STEP_TITLE:'Step '+(step?stepNumber(step, stepIndex):0)+' / '+storyStepCount;
+  var stepCountText=isDraft?DRAFT_STEP_COUNT_TEXT:String(storyStepCount);
+  document.getElementById('counter').textContent=step&&step.is_support?SUPPORT_STEP_TITLE:'Step '+(step?stepNumber(step, stepIndex):0)+' / '+stepCountText;
   document.getElementById('prevBtn').disabled=stepIndex<=0;
   document.getElementById('nextBtn').disabled=!canGoNext();
   renderStepList();
@@ -3525,7 +3539,7 @@ function storyFingerprint(minimapPart){
   var comments=story.comments||[];
   // 解決の状態と行を見失った印は comments.json が持ち主で、別のタブや skill や追従からも変わるので指紋に入れる
   var commentPart=comments.length+'#'+comments.map(function(comment){return (comment.replies||[]).length+(isResolvedComment(comment)?'r':'')+(isLineLostComment(comment)?'l':'');}).join(',');
-  return minimapPart+'@'+story.title+'@'+overviewPart+'@'+stepPart+'@'+commentPart;
+  return minimapPart+'@'+story.title+'@'+(story.is_draft===true?'下書き':'清書')+'@'+overviewPart+'@'+stepPart+'@'+commentPart;
 }
 var storySignature='';
 var minimapSignature='';
@@ -3863,6 +3877,7 @@ function main() {
     const diagramNote = diagramStepCount > 0 ? "(図 " + diagramStepCount + "枚)" : "";
     const supportIdCount = validation.resolvedSupport.reduce((total, entry) => total + entry.owns.length, 0);
     const supportNote = supportIdCount > 0 ? "(うち補助 " + supportIdCount + "件)" : "";
+    clearDraftMark(targetDir);
     console.log("ok: 全" + changes.change_ids.length + "件の変更IDがちょうど1回ずつ owns に入っています" + supportNote + diagramNote);
     if (advisory.length > 0) {
       console.log("参考 目安 " + stepSizeGuide + "行を超えるstep(浅く広い機械的変更や自動生成物ならこのままでよい。密な実装なら分割を検討)");

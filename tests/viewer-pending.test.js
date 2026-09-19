@@ -70,6 +70,11 @@ function withOverview(story, overview) {
   return story;
 }
 
+function withDraft(story) {
+  story.is_draft = true;
+  return story;
+}
+
 // 簡易 markdown が書き出した本文の行を、書かれた順に取り出す
 function narrationLines(createdElements, fromIndex) {
   return createdElements.slice(fromIndex || 0).filter((element) => element.className === "md-line").map((element) => element.innerHTML);
@@ -126,6 +131,27 @@ test("追従で増えたコマでは、説明文を書いている途中だと�
   const { createdElements, elementsById } = makeViewer(makeStory([makeStep(1, "修正1回目", "")]));
   assert.strictEqual(elementsById.narration.className, "narration");
   assert.ok(!narrationLines(createdElements).some((html) => html.includes("説明文をいま書いています")));
+});
+
+test("区切りが下書きの間は、題が仮の表示になり分母も数を出さない", () => {
+  const { elementsById } = makeViewer(withDraft(makeStory([makeStep(1, "仮の題", ""), makeStep(2, "仮の題", "")])));
+  assert.strictEqual(elementsById.storyTitle.textContent, "仮の表示です。AI が構成を考えています…");
+  assert.strictEqual(elementsById.counter.textContent, "Step 1 / …");
+});
+
+test("清書が届くと、題も分母も本物に入れ替わる", () => {
+  const viewerParts = makeViewer(withDraft(makeStory([makeStep(1, "仮の題", ""), makeStep(2, "仮の題", "")])));
+  viewerParts.serveStory(makeStory([makeStep(1, "入口で検証を通す", "説明"), makeStep(2, "重複した確認を消す", "説明"), makeStep(3, "テストを1つにまとめる", "説明")]));
+  viewerParts.poll();
+  assert.strictEqual(viewerParts.elementsById.storyTitle.textContent, "題名");
+  assert.strictEqual(viewerParts.elementsById.counter.textContent, "Step 1 / 3");
+});
+
+test("指紋は下書きから清書に変わったことを拾う", () => {
+  const { viewer } = makeViewer(makeStory([makeStep(1, "1つ目", "説明")]));
+  const draftFingerprint = fingerprintOf(viewer, withDraft(makeStory([makeStep(1, "1つ目", "説明")])));
+  const doneFingerprint = fingerprintOf(viewer, makeStory([makeStep(1, "1つ目", "説明")]));
+  assert.notStrictEqual(draftFingerprint, doneFingerprint);
 });
 
 test("全体像の箇条書きが配列でなくても、取り直しで画面が更新され続ける", () => {
