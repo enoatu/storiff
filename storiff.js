@@ -644,6 +644,30 @@ const NOISE_PATTERNS = ["*.lock", "package-lock.json", "yarn.lock", "pnpm-lock.y
 // 自動生成ファイル。除外はせず末尾の場面に回す。config.json の generated で追加できる
 const GENERATED_PATTERNS = ["*.generated.*", "*.gen.*", "*.pb.go"];
 
+// コマの中身を見て質を確かめる先。文章を作らず段階と確率だけ返すので 0.3 秒で返る
+// 差分が外に出るので、config.json に鍵を書いたときだけ動かす。既定では何もしない
+const AUDIT_URL = "https://openrouter.ai/api/alpha/decisions";
+const AUDIT_MODEL = "typesafe/jev-1.13";
+const AUDIT_TIMEOUT_MSEC = 20000;
+
+// 1コマから送る変更行の上限。端だけでは意図が混ざっているかどうかを見分けられない
+const AUDIT_SAMPLE_LINES = 14;
+
+// 別々の意図が混ざっている段階。この目安を超えたコマだけ知らせる
+const AUDIT_MIXED_CRITERIA = [
+  "全部が1つの意図でやった作業になっている",
+  "ほぼ1つの意図だが、関係の薄い変更が少し混ざっている",
+  "2つの別々の意図が同じくらい入っている",
+  "3つ以上の別々の意図がばらばらに入っている",
+];
+const AUDIT_MIXED_MAX = 1.5;
+
+// 題が中身と合っているかの確からしさ。これを下回ったコマだけ知らせる
+const AUDIT_TITLE_FIT_MIN = 0.5;
+
+// 本編から外してよいかの確からしさ。これを超えたコマだけ知らせる
+const AUDIT_ASIDE_MIN = 0.6;
+
 function matchesFilePattern(filePath, patterns) {
   if (!filePath) return false;
   const base = filePath.split("/").pop();
@@ -1391,6 +1415,109 @@ function buildStepRisksIssues(stepList) {
     else if (countFilledItems(step.risks) === 0) issues.push("step" + order + " risks が空だけです。無いなら risks ごと消す");
   });
   return issues;
+}
+
+// 鍵は config.json に書いたときだけ読む。書いていなければ中身を外に出さない
+function readAuditKey() {
+  // 改行が混ざったままだと送る前の組み立てで落ちるので、どちらの経路でも前後を落とす
+  const fromEnv = String(process.env.OPENROUTER_API_KEY || "").trim();
+  if (fromEnv !== "") return fromEnv;
+  const fromConfig = String(loadConfig().openrouter_key || "").trim();
+  return fromConfig !== "" ? fromConfig : null;
+}
+
+// そのコマが抱える変更行をファイルごとにまとめる。どのファイルの話かが混ざり具合の手がかりになる
+function buildAuditStepBody(step, files) {
+  const lineByChangeId = new Map();
+  const fileByChangeId = new Map();
+  for (const file of files) {
+    for (const line of file.lines) {
+      if (line.id == null) continue;
+      lineByChangeId.set(line.id, line);
+      fileByChangeId.set(line.id, file.repo && file.repo !== "." ? file.repo + " " + file.file : file.file);
+    }
+  }
+  const idsByFile = new Map();
+  for (const id of step.owns) {
+    const file = fileByChangeId.get(id);
+    if (file == null) continue;
+    if (!idsByFile.has(file)) idsByFile.set(file, []);
+    idsByFile.get(file).push(id);
+  }
+  const perFileMax = Math.max(2, Math.floor(AUDIT_SAMPLE_LINES / Math.max(1, idsByFile.size)));
+  const body = {};
+  for (const [file, ids] of idsByFile) {
+    body[file] = ids.slice(0, perFileMax).map((id) => {
+      const line = lineByChangeId.get(id);
+      return (line.kind === "del" ? "- " : "+ ") + line.text;
+    });
+  }
+  return body;
+}
+
+// 全コマを1回のやり取りでまとめて見てもらう。問いを増やしても返る速さはほとんど変わらない
+function buildAuditRequest(resolvedSteps, files) {
+  const state = {};
+  const questions = {};
+  resolvedSteps.forEach((step, index) => {
+    state["コマ" + index] = { 題: step.title || "", 変更行: buildAuditStepBody(step, files) };
+    questions[index + "_混ざり"] = {
+      type: "score",
+      instructions: "コマ" + index + " に入っている変更は、どれくらい別々の意図が混ざっているか",
+      criteria: AUDIT_MIXED_CRITERIA,
+    };
+    questions[index + "_題"] = {
+      type: "noul",
+      instructions: "コマ" + index + " の題は、そこに入っている変更を言い表しているか",
+    };
+    questions[index + "_脇"] = {
+      type: "noul",
+      instructions: "コマ" + index + " は、読んでも意図が分からない機械的な追従ばかりで、本編から外してよいか",
+    };
+  });
+  return { model: AUDIT_MODEL, state, questions };
+}
+
+// 返ってきた段階と確からしさを、目安を外れたコマの知らせに直す
+function buildAuditIssues(resolvedSteps, answers) {
+  const mixedLines = [];
+  const titleLines = [];
+  const asideLines = [];
+  resolvedSteps.forEach((step, index) => {
+    const order = step.order != null ? step.order : index + 1;
+    const label = "step" + order + " " + (step.title || "") + " (" + step.owns.length + "行)";
+    const mixed = answers[index + "_混ざり"];
+    const titleFit = answers[index + "_題"];
+    const aside = answers[index + "_脇"];
+    if (mixed != null && mixed.score >= AUDIT_MIXED_MAX) mixedLines.push(label + " 混ざり " + mixed.score.toFixed(2));
+    if (titleFit != null && titleFit.noul < AUDIT_TITLE_FIT_MIN) titleLines.push(label + " 題の当たり " + titleFit.noul.toFixed(2));
+    if (aside != null && aside.noul >= AUDIT_ASIDE_MIN) asideLines.push(label + " 脇に置ける " + aside.noul.toFixed(2));
+  });
+  return { mixedLines, titleLines, asideLines };
+}
+
+function runAudit(resolvedSteps, files, onResult) {
+  const apiKey = readAuditKey();
+  if (apiKey == null) {
+    onResult(null);
+    return;
+  }
+  const request = buildAuditRequest(resolvedSteps, files);
+  fetch(AUDIT_URL, {
+    method: "POST",
+    headers: { Authorization: "Bearer " + apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify(request),
+    signal: AbortSignal.timeout(AUDIT_TIMEOUT_MSEC),
+  })
+    .then((response) => response.json())
+    .then((result) => {
+      if (result.error != null || result.answers == null) throw new Error(JSON.stringify(result.error || result));
+      onResult(buildAuditIssues(resolvedSteps, result.answers));
+    })
+    .catch((error) => {
+      console.log("参考 コマの中身は見られませんでした(" + String(error.message).split("\n")[0].slice(0, 120) + ")");
+      onResult(null);
+    });
 }
 
 // 理由の無い support は、脇に置いたのか入れ忘れたのか読み手に見分けが付かない
@@ -3904,6 +4031,22 @@ function main() {
       console.log("参考 脇に置いた分の理由(補助のコマにそのまま出る)");
       for (const issue of supportIssues) console.log("  " + issue);
     }
+    // 変更IDの数え上げでは中身の質が分からない。鍵があるときだけ、コマの中身も見てもらう
+    runAudit(validation.resolvedSteps, changes.files, (auditIssues) => {
+      if (auditIssues == null) return;
+      if (auditIssues.mixedLines.length > 0) {
+        console.log("参考 別々の意図が混ざっているstep(分ける先を探す。1つの意図なら題を直す)");
+        for (const line of auditIssues.mixedLines) console.log("  " + line);
+      }
+      if (auditIssues.titleLines.length > 0) {
+        console.log("参考 題が中身と合っていないstep(何をなぜやったかが伝わる言葉に直す)");
+        for (const line of auditIssues.titleLines) console.log("  " + line);
+      }
+      if (auditIssues.asideLines.length > 0) {
+        console.log("参考 本編から外せそうなstep(理由を添えて support に移す)");
+        for (const line of auditIssues.asideLines) console.log("  " + line);
+      }
+    });
     return;
   }
   if (command === "fill") {
@@ -4060,6 +4203,9 @@ module.exports.buildUnassignedFileLines = buildUnassignedFileLines;
 module.exports.buildOverviewIssues = buildOverviewIssues;
 module.exports.buildStepRisksIssues = buildStepRisksIssues;
 module.exports.buildSupportIssues = buildSupportIssues;
+module.exports.buildAuditRequest = buildAuditRequest;
+module.exports.buildAuditIssues = buildAuditIssues;
+module.exports.readAuditKey = readAuditKey;
 module.exports.parseDiagram = parseDiagram;
 module.exports.buildDiagramValidation = buildDiagramValidation;
 module.exports.resolveBaseRef = resolveBaseRef;
