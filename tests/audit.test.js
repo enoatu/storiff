@@ -4,7 +4,7 @@ const fs = require("fs");
 const os = require("os");
 const path = require("path");
 const { execFileSync } = require("child_process");
-const { buildAuditRequest, buildAuditIssues, readAuditKey } = require("../storiff.js");
+const { buildAuditRequest, buildAuditIssues, readAuditKey, hideKeyInText } = require("../storiff.js");
 
 function makeTempDir(prefix) {
   return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
@@ -91,15 +91,43 @@ test("鍵が無ければ何も返さない", () => {
   fs.rmSync(homeDir, { recursive: true, force: true });
 });
 
-test("鍵が config.json にあれば読む", () => {
+// 鍵を置いた config.json を作り、readAuditKey を別のプロセスで呼んだ出力をそのまま返す
+function runReadAuditKey(mode) {
   const homeDir = makeTempDir("storiff-audit-home-");
   fs.mkdirSync(path.join(homeDir, ".storiff"));
-  fs.writeFileSync(path.join(homeDir, ".storiff", "config.json"), JSON.stringify({ openrouter_key: "sk-test" }));
-  const result = execFileSync(process.execPath, ["-e", `
+  fs.writeFileSync(path.join(homeDir, ".storiff", "config.json"), JSON.stringify({ openrouter_key: "ため し" }), { mode });
+  const output = execFileSync(process.execPath, ["-e", `
     process.env.OPENROUTER_API_KEY = "";
     process.env.HOME = ${JSON.stringify(homeDir)};
     console.log(String(require(${JSON.stringify(path.join(__dirname, "..", "storiff.js"))}).readAuditKey()));
   `], { encoding: "utf8" });
-  assert.strictEqual(result.trim(), "sk-test");
   fs.rmSync(homeDir, { recursive: true, force: true });
+  return output;
+}
+
+test("鍵が config.json にあれば読む", () => {
+  const output = runReadAuditKey(0o600);
+  assert.strictEqual(output.trim(), "ため し");
+});
+
+test("置き場が誰からも読める権限なら直し方を知らせる", () => {
+  const output = runReadAuditKey(0o644);
+  assert.ok(output.includes("自分以外からも読める権限です"), output);
+  assert.ok(output.includes("chmod 600"), output);
+  assert.ok(output.includes("ため し"), output);
+});
+
+test("通信の失敗を出すときは鍵の文字を伏せる", () => {
+  const shown = hideKeyInText("Bearer ためし が拒まれました", "ためし");
+  assert.strictEqual(shown, "Bearer (鍵) が拒まれました");
+});
+
+test("鍵が無いときの失敗はそのまま出す", () => {
+  assert.strictEqual(hideKeyInText("つながりませんでした", null), "つながりませんでした");
+});
+
+test("失敗の知らせは1行に収めて長さも切る", () => {
+  const shown = hideKeyInText("1行目\n2行目", null);
+  assert.strictEqual(shown, "1行目");
+  assert.strictEqual(hideKeyInText("あ".repeat(200), null).length, 120);
 });

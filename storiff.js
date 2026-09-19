@@ -1423,7 +1423,22 @@ function readAuditKey() {
   const fromEnv = String(process.env.OPENROUTER_API_KEY || "").trim();
   if (fromEnv !== "") return fromEnv;
   const fromConfig = String(loadConfig().openrouter_key || "").trim();
-  return fromConfig !== "" ? fromConfig : null;
+  if (fromConfig === "") return null;
+  // 鍵を書く場所が誰からも読める権限だと、同じ機械の別の人に見えてしまう
+  const configPath = path.join(os.homedir(), ".storiff", "config.json");
+  try {
+    const mode = fs.statSync(configPath).mode & 0o077;
+    if (mode !== 0) console.log("参考 " + configPath + " が自分以外からも読める権限です。chmod 600 " + configPath + " を実行してください");
+  } catch (error) {
+    // 権限を確かめられないだけなので、鍵はそのまま使う
+  }
+  return fromConfig;
+}
+
+// 通信の失敗をそのまま出すと、送った中身や鍵が混ざることがある。鍵の文字は必ず伏せる
+function hideKeyInText(text, apiKey) {
+  const shown = String(text).split("\n")[0].slice(0, 120);
+  return apiKey == null || apiKey === "" ? shown : shown.split(apiKey).join("(鍵)");
 }
 
 // そのコマが抱える変更行をファイルごとにまとめる。どのファイルの話かが混ざり具合の手がかりになる
@@ -1515,7 +1530,7 @@ function runAudit(resolvedSteps, files, onResult) {
       onResult(buildAuditIssues(resolvedSteps, result.answers));
     })
     .catch((error) => {
-      console.log("参考 コマの中身は見られませんでした(" + String(error.message).split("\n")[0].slice(0, 120) + ")");
+      console.log("参考 コマの中身は見られませんでした(" + hideKeyInText(error.message, apiKey) + ")");
       onResult(null);
     });
 }
@@ -4206,6 +4221,7 @@ module.exports.buildSupportIssues = buildSupportIssues;
 module.exports.buildAuditRequest = buildAuditRequest;
 module.exports.buildAuditIssues = buildAuditIssues;
 module.exports.readAuditKey = readAuditKey;
+module.exports.hideKeyInText = hideKeyInText;
 module.exports.parseDiagram = parseDiagram;
 module.exports.buildDiagramValidation = buildDiagramValidation;
 module.exports.resolveBaseRef = resolveBaseRef;
