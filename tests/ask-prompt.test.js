@@ -170,3 +170,20 @@ test("D2 ファイル名にリポジトリが添えられる", (t) => {
   const prompt = buildAskPrompt(targetDir, comment);
   assert.match(prompt, /ファイル repoB index\.js/);
 });
+
+test("D3 どの範囲でも答えだけを書く釘が入る", (t) => {
+  const targetDir = makeTempDir();
+  t.after(() => fs.rmSync(targetDir, { recursive: true, force: true }));
+  fs.writeFileSync(path.join(targetDir, "changes.json"), JSON.stringify({
+    files: [{ file: "app.js", repo: ".", lines: [{ kind: "add", text: "ownsの行", id: 1 }] }],
+  }));
+  fs.writeFileSync(path.join(targetDir, "steps.json"), JSON.stringify({
+    title: "ストーリーの題", steps: [{ order: 1, title: "導入", narration: "説明", owns: [1], refs: [] }],
+  }));
+  const comment = { change_id: 1, file: "app.js", repo: ".", line: 1, step_order: 1, body: "これは何のためか" };
+  for (const scope of ["line", "step", "story"]) {
+    const prompt = buildAskPrompt(targetDir, Object.assign({}, comment, { scope }));
+    assert.match(prompt, /答えだけを書いてください/);
+    assert.match(prompt, /返事をどう届けるかや、この場についての説明は書かないでください/);
+  }
+});

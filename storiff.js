@@ -22,6 +22,9 @@ const CHANGED_LINES_PER_STEP_GUIDE = 80;
 const DRAFT_STEP_COUNT_MIN = 3;
 const DRAFT_STEP_COUNT_MAX = 10;
 
+// 質問に答える claude は会話中のセッションを resume するため、返事の届け方や場の事情を書き足しがち。答えだけを返させる
+const ASK_ANSWER_RULE = "答えだけを書いてください。返事をどう届けるかや、この場についての説明は書かないでください";
+
 const CLAUDE_TIMEOUT_MSEC = 180000;
 
 // claude の子プロセス1本から受け取る標準出力の上限。壊れた出力で親のメモリを使い切らないように切る
@@ -1733,7 +1736,7 @@ function buildAskPrompt(targetDir, comment, changes) {
   const scope = commentScope(comment);
   if (scope === "story") {
     const titleLines = (steps.steps || []).map((candidate, index) => (candidate.order != null ? candidate.order : index + 1) + " " + (candidate.title || ""));
-    return ["以下のストーリー全体について、レビュアーからの質問に簡潔に答えてください", "",
+    return ["以下のストーリー全体について、レビュアーからの質問に簡潔に答えてください", ASK_ANSWER_RULE, "",
       "ストーリーの題 " + (steps.title || ""), "", "コマの一覧", ...titleLines, "", "質問 " + comment.body].join("\n");
   }
   const target = findCommentTarget(resolvedChanges.files, comment);
@@ -1741,7 +1744,7 @@ function buildAskPrompt(targetDir, comment, changes) {
   const resolvedStep = step ? resolveSteps(resolvedChanges.files, [step]).resolvedSteps[0] : null;
   const ownedIds = resolvedStep ? new Set([...resolvedStep.owns, ...resolvedStep.refs]) : null;
   if (scope === "step") {
-    return ["以下のコマについて、レビュアーからの質問に簡潔に答えてください", "",
+    return ["以下のコマについて、レビュアーからの質問に簡潔に答えてください", ASK_ANSWER_RULE, "",
       "コマの題 " + (step ? step.title : ""), "ストーリーの説明 " + (step ? step.narration : ""), "",
       "このコマの差分", buildChangesText(resolvedChanges.files, ownedIds || new Set()), "質問 " + comment.body].join("\n");
   }
@@ -1752,6 +1755,7 @@ function buildAskPrompt(targetDir, comment, changes) {
   const repoTag = repo && repo !== "." ? repo + " " : "";
   const promptLines = [
     "以下のコード差分について、レビュアーからの質問に簡潔に答えてください",
+    ASK_ANSWER_RULE,
     "",
     "ファイル " + repoTag + comment.file,
     "ストーリーの説明 " + narration,
